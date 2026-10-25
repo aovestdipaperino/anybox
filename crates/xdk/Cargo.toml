@@ -1,0 +1,18 @@
+[package]
+name = "xdk"
+description = "Finds statically linked Xbox XDK functions by byte signature"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+authors.workspace = true
+repository.workspace = true
+
+[dependencies]
+iced-x86 = { version = "1.21", default-features = false, features = ["std", "decoder", "instr_info"] }
+
+[dev-dependencies]
+iced-x86 = { version = "1.21", features = ["code_asm"] }
+
+[lints]
+workspace = true

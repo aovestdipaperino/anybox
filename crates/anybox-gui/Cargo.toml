@@ -1,0 +1,24 @@
+[package]
+name = "anybox-gui"
+description = "Turns an original Xbox disc image into a macOS app, in a DMG, from a window"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+authors.workspace = true
+repository.workspace = true
+
+[[bin]]
+name = "anybox-gui"
+path = "src/main.rs"
+
+[dependencies]
+anybox-core = { path = "../anybox-core" }
+futures = "0.3"
+gpui-kit = "0.8"
+objc2 = "0.6"
+objc2-app-kit = { version = "0.3", features = ["NSApplication", "NSImage", "NSResponder"] }
+objc2-foundation = { version = "0.3", features = ["NSData"] }
+
+[lints]
+workspace = true

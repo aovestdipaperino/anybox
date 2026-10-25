@@ -1,0 +1,37 @@
+# Signatures read from titles' own library code, for the XDK 4831 functions XbSymbolDatabase
+# (signatures.txt) has no usable signature for. Same format as signatures.txt; the runtime and
+# `anybox` read this file after it, as one list. Patterns come from the code of BLiNX The Time
+# Sweeper and Dragon's Lair 3D; link-dependent bytes are `??`.
+#
+# Most IDirectSound and IDirectSoundBuffer methods are thunks of one shape: step `this` back (by 8,
+# or 0x1C for a buffer), call the C++ method, return. Those are told apart by what they call
+# (`| offset: pattern`): the method, which enters DirectSound's critical section and calls the voice
+# or buffer function under it, and that function, whose code is its own (SetHeadroom stores at
+# +0x20 and moves the volume at +0x1C, GetStatus reads the voice state at +0x12, and so on).
+# SetMixBins and SetMixBinVolumes go one call deeper, to the settings function each calls. Match
+# numbers would not do: BLiNX's third two-argument thunk is SetHeadroom, its fourth SetMixBins,
+# its fifth SetMixBinVolumes and its third three-argument one SetBufferData, which in Dragon's Lair
+# are GetStatus, SetFormat, SetFrequency and SetPlayRegion.
+#
+# SetFrequency is here rather than in signatures.txt: XbSymbolDatabase's matches several thunks in
+# both titles.
+IDirectSoundBuffer::SetPitch | 8 | 8B 44 24 04 FF 74 24 08 8B C8 83 C0 E4 F7 D9 1B C9 23 C8 51 E8 ?? ?? ?? ?? C2 08 00 | 21: 56 E8 ?? ?? ?? ?? 83 3D ?? ?? ?? ?? 00 0F B6 F0 74 16 85 F6 74 0B 68 ?? ?? ?? ?? FF 15 ?? ?? ?? ?? B8 05 40 00 80 EB 22 57 FF 74 24 10 FF 74 24 10 E8 ?? ?? ?? ?? | 50: 8B 44 24 04 8B 48 10 8B 54 24 08 89 51 18 8B 48 0C E8 ?? ?? ?? ?? C2 08 00
+IDirectSoundBuffer::SetHeadroom | 8 | 8B 44 24 04 FF 74 24 08 8B C8 83 C0 E4 F7 D9 1B C9 23 C8 51 E8 ?? ?? ?? ?? C2 08 00 | 21: 56 E8 ?? ?? ?? ?? 83 3D ?? ?? ?? ?? 00 0F B6 F0 74 16 85 F6 74 0B 68 ?? ?? ?? ?? FF 15 ?? ?? ?? ?? B8 05 40 00 80 EB 22 57 FF 74 24 10 FF 74 24 10 E8 ?? ?? ?? ?? | 50: 8B 54 24 04 8B 42 10 8B 48 20 56 8B 74 24 0C 2B CE 01 48 1C 89 70 20 8B 4A 0C E8 ?? ?? ?? ?? 5E C2 08 00
+IDirectSoundBuffer::SetMixBins | 8 | 8B 44 24 04 FF 74 24 08 8B C8 83 C0 E4 F7 D9 1B C9 23 C8 51 E8 ?? ?? ?? ?? C2 08 00 | 21: 56 E8 ?? ?? ?? ?? 83 3D ?? ?? ?? ?? 00 0F B6 F0 74 16 85 F6 74 0B 68 ?? ?? ?? ?? FF 15 ?? ?? ?? ?? B8 05 40 00 80 EB 22 57 FF 74 24 10 FF 74 24 10 E8 ?? ?? ?? ?? | 50: 56 8B 74 24 08 FF 74 24 0C 8B 4E 10 E8 ?? ?? ?? ?? | 13: 8B 44 24 04 85 C0 75 1A F6 41 08 10 74 07 B8 ?? ?? ?? ?? EB 0D 0F B6 41 0E D1 E8 8B 04 85 ?? ?? ?? ?? 83 61 24 00 80 38 00
+IDirectSoundBuffer::SetMixBinVolumes | 8 | 8B 44 24 04 FF 74 24 08 8B C8 83 C0 E4 F7 D9 1B C9 23 C8 51 E8 ?? ?? ?? ?? C2 08 00 | 21: 56 E8 ?? ?? ?? ?? 83 3D ?? ?? ?? ?? 00 0F B6 F0 74 16 85 F6 74 0B 68 ?? ?? ?? ?? FF 15 ?? ?? ?? ?? B8 05 40 00 80 EB 22 57 FF 74 24 10 FF 74 24 10 E8 ?? ?? ?? ?? | 50: 56 8B 74 24 08 FF 74 24 0C 8B 4E 10 E8 ?? ?? ?? ?? | 13: 56 8B 74 24 08 33 D2 39 16 76 16 57 8B 46 04 8D 04 D0 8B 38 8B 40 04 42 89 44 B9 30 3B 16 72 EC 5F 5E C2 04 00
+IDirectSoundBuffer::SetFrequency | 8 | 8B 44 24 04 FF 74 24 08 8B C8 83 C0 E4 F7 D9 1B C9 23 C8 51 E8 ?? ?? ?? ?? C2 08 00 | 21: 56 E8 ?? ?? ?? ?? 83 3D ?? ?? ?? ?? 00 0F B6 F0 74 16 85 F6 74 0B 68 ?? ?? ?? ?? FF 15 ?? ?? ?? ?? B8 05 40 00 80 EB 22 57 FF 74 24 10 FF 74 24 10 E8 ?? ?? ?? ?? | 50: 8B 44 24 08 85 C0 56 8B 74 24 08 75 06 8B 46 10 8B 40 10 50 E8 ?? ?? ?? ?? 50 56 E8 ?? ?? ?? ?? 5E C2 08 00
+IDirectSoundBuffer::Pause | 8 | 8B 44 24 04 FF 74 24 08 8B C8 83 C0 E4 F7 D9 1B C9 23 C8 51 E8 ?? ?? ?? ?? C2 08 00 | 21: 56 E8 ?? ?? ?? ?? 83 3D ?? ?? ?? ?? 00 0F B6 F0 74 16 85 F6 74 0B 68 ?? ?? ?? ?? FF 15 ?? ?? ?? ?? B8 05 40 00 80 EB 25 8B 44 24 08 8B 48 20 57 FF 74 24 10 E8 ?? ?? ?? ?? | 53: 55 8B EC 51 51 83 65 FC 00 56 8B F1 8D 4D F8 E8 ?? ?? ?? ?? 8A 46 12 24 03 3C 03 75 44 83 7D 08 00 75 13 0F B7 46 12 83 E0 BB
+IDirectSoundBuffer::SetCurrentPosition | 8 | 8B 44 24 04 FF 74 24 08 8B C8 83 C0 E4 F7 D9 1B C9 23 C8 51 E8 ?? ?? ?? ?? C2 08 00 | 21: 56 E8 ?? ?? ?? ?? 83 3D ?? ?? ?? ?? 00 0F B6 F0 74 16 85 F6 74 0B 68 ?? ?? ?? ?? FF 15 ?? ?? ?? ?? B8 05 40 00 80 EB 25 8B 44 24 08 8B 48 20 57 FF 74 24 10 E8 ?? ?? ?? ?? | 53: 55 8B EC 83 EC 0C 83 65 FC 00 83 65 F8 00 56 8B F1 8A 46 12 24 03 3C 03 0F 85 C0 00 00 00 0F B6 46 64 0F B7 44 46 0A 8B 0D ?? ?? ?? ??
+IDirectSoundBuffer::GetCurrentPosition | 12 | 8B 44 24 04 FF 74 24 0C 8B C8 FF 74 24 0C 83 C0 E4 F7 D9 1B C9 23 C8 51 E8 ?? ?? ?? ?? C2 0C 00 | 25: 56 E8 ?? ?? ?? ?? 83 3D ?? ?? ?? ?? 00 0F B6 F0 74 16 85 F6 74 0B 68 ?? ?? ?? ?? FF 15 ?? ?? ?? ?? B8 05 40 00 80 EB 29 8B 44 24 08 8B 48 20 57 FF 74 24 14 FF 74 24 14 E8 ?? ?? ?? ?? | 57: 55 8B EC 51 51 83 65 FC 00 53 56 8B F1 57 8D 4D F8 E8 ?? ?? ?? ?? 8A 46 12 24 03 3C 03 0F 85 87 00 00 00 8B CE E8 ?? ?? ?? ??
+IDirectSound::SetI3DL2Listener | 12 | 8B 44 24 04 FF 74 24 0C 8B C8 FF 74 24 0C 83 C0 F8 F7 D9 1B C9 23 C8 51 E8 ?? ?? ?? ?? C2 0C 00 | 25: 56 57 33 FF E8 ?? ?? ?? ?? 39 3D ?? ?? ?? ?? 0F B6 F0 74 19 3B F7 74 0B 68 ?? ?? ?? ?? FF 15 ?? ?? ?? ?? B8 05 40 00 80 E9 ?? ?? ?? ?? 8B 44 24 0C 8B 50 08 83 7A 0C FF 75 0A BF 32 00 78 88 E9 ?? ?? ?? ?? 8B 4C 24 10 53 8B 19 89 5A 74 8B 59 04 8B 50 08 89 5A 78 D9 41 08 8B 50 08 D9 5A 7C
+# IDirectSound::CreateSoundBuffer(this, desc, &buffer, outer): the thunk (`this` back by 8).
+# CreateSoundStream's thunk has the same bytes, so it is told apart by the method it calls:
+# Marvel vs. Capcom 2 (XDK 5028) links both.
+IDirectSound::CreateSoundBuffer | 16 | FF 74 24 10 8B 44 24 08 FF 74 24 10 8B C8 FF 74 24 10 83 C0 F8 F7 D9 1B C9 23 C8 51 E8 <CDirectSound_CreateSoundBuffer> C2 10 00
+# IDirectSoundBuffer::Lock(this, offset, bytes, &first, &first_bytes, &second, &second_bytes,
+# flags): the only buffer thunk with 32 bytes of arguments.
+IDirectSoundBuffer::Lock | 32 | 55 8B EC FF 75 24 8B 45 08 FF 75 20 8B C8 FF 75 1C 83 C0 E4 FF 75 18 F7 D9 FF 75 14 1B C9 FF 75 10 23 C8 FF 75 0C 51 E8 ?? ?? ?? ?? 5D C2 20 00
+# A DSOUND function of XDK 5028 that XbSymbolDatabase does not name, so the name here is ours:
+# (0, count, &object) makes a 0x98-byte object that opens its own DirectSound, keeps a periodic
+# kernel timer and is told the time (its method 3). Marvel vs. Capcom 2's sound engine calls it.
+DSound_TimerObjectCreate | 12 | 56 57 68 98 00 00 00 E8 ?? ?? ?? ?? 85 C0 74 0B 8B C8 E8 ?? ?? ?? ?? 8B F0 EB 02 33 F6 85 F6 75 07 BF 0E 00 07 80 EB 29 FF 74 24 10 8B 06 FF 74 24 10 56 FF 50 1C 8B F8 85 FF 7C 08 8B 44 24 14 89 30 EB 0D 8B CE E8 ?? ?? ?? ?? 56 E8 ?? ?? ?? ?? 8B C7 5F 5E C2 0C 00

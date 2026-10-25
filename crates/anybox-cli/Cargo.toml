@@ -1,0 +1,19 @@
+[package]
+name = "anybox-cli"
+description = "Turns an original Xbox disc image into a macOS app, in a DMG, from the command line"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+authors.workspace = true
+repository.workspace = true
+
+[[bin]]
+name = "anybox"
+path = "src/main.rs"
+
+[dependencies]
+anybox-core = { path = "../anybox-core" }
+
+[lints]
+workspace = true

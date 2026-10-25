@@ -1,0 +1,41 @@
+[package]
+name = "runtime"
+description = "The clean-room Xbox runtime: kernel HLE, GPU model, renderer and host layer"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+authors.workspace = true
+repository.workspace = true
+
+[lib]
+crate-type = ["staticlib", "lib"]
+
+[dependencies]
+cpal = "0.18.2"
+crt-off = { version = "0.2.1", default-features = false }
+des = "0.8"
+hmac = "0.12"
+image = { version = "0.25", default-features = false }
+libc = "0.2"
+minifb = "0.29.0"
+num-bigint = "0.4"
+objc2 = "0.6"
+objc2-app-kit = { version = "0.3", features = ["objc2-quartz-core"] }
+objc2-core-foundation = { version = "0.3", features = ["CFCGTypes"] }
+objc2-foundation = "0.3"
+objc2-quartz-core = { version = "0.3", features = ["CALayer", "CAMetalLayer", "CATransaction"] }
+pack = { path = "../pack" }
+png = "0.18.1"
+pollster = "1.0.1"
+postcard = { version = "1", default-features = false, features = ["use-std"] }
+raw-window-handle = "0.6"
+serde = { version = "1", features = ["derive", "rc"] }
+sha1 = { version = "0.10", features = ["compress"] }
+wgpu = "30.0.1"
+xbe = { path = "../xbe" }
+xdk = { path = "../xdk" }
+zstd = { version = "0.13", default-features = false }
+
+[lints]
+workspace = true

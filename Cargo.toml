@@ -1,0 +1,24 @@
+[workspace]
+resolver = "3"
+members = ["crates/*"]
+
+[workspace.package]
+version = "0.1.0"
+edition = "2024"
+rust-version = "1.99"
+license = "MIT OR Apache-2.0"
+authors = ["Enzo Lombardi <enzinol@gmail.com>"]
+repository = "https://github.com/aovestdipaperino/anybox"
+
+[workspace.lints.rust]
+missing_debug_implementations = "warn"
+unsafe_op_in_unsafe_fn = "warn"
+unused_lifetimes = "warn"
+
+[workspace.lints.clippy]
+pedantic = { level = "warn", priority = -1 }
+perf = { level = "warn", priority = -1 }
+
+# The pack's zstd code decodes every read; at opt-level 0 the tests would take far too long.
+[profile.dev.package.zstd-sys]
+opt-level = 3

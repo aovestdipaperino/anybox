@@ -1,0 +1,18 @@
+[package]
+name = "lift"
+description = "Lifts 32-bit x86 functions to Rust, for compilation to native code"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+authors.workspace = true
+repository.workspace = true
+
+[dependencies]
+iced-x86 = { version = "1.21", default-features = false, features = ["std", "decoder", "instr_info"] }
+
+[dev-dependencies]
+object = { version = "0.37", default-features = false, features = ["read_core", "macho", "std"] }
+
+[lints]
+workspace = true

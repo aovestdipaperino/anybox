@@ -1,0 +1,21 @@
+[package]
+name = "anybox-core"
+description = "Turns an original Xbox disc image into a macOS app, in a DMG: the work behind the front ends"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+authors.workspace = true
+repository.workspace = true
+
+[dependencies]
+iced-x86 = { version = "1.21", default-features = false, features = ["std", "decoder"] }
+lift = { path = "../lift" }
+pack = { path = "../pack" }
+sha1 = "0.10"
+xbe = { path = "../xbe" }
+xdk = { path = "../xdk" }
+xiso = { path = "../xiso" }
+
+[lints]
+workspace = true
