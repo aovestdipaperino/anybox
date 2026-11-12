@@ -25,6 +25,7 @@ mod layout;
 pub mod progress;
 pub mod toolchain;
 
+use std::collections::BTreeSet;
 use std::path::{Path, PathBuf};
 
 use progress::{Phase, Reporter, Tracker, clock, note};
@@ -226,17 +227,18 @@ impl Lifted {
         rust: bool,
         image: &lift::Image,
         roots: &[u32],
+        weak: &BTreeSet<u32>,
         hooks: &std::collections::BTreeMap<u32, u32>,
         tracing: bool,
         progress: &mut dyn FnMut(usize, usize),
     ) -> Self {
         if rust {
             Self::Rust(lift::rust::lift_program_with_progress(
-                image, roots, hooks, tracing, progress,
+                image, roots, weak, hooks, tracing, progress,
             ))
         } else {
             Self::C(lift::lift_program_with_progress(
-                image, roots, hooks, tracing, progress,
+                image, roots, weak, hooks, tracing, progress,
             ))
         }
     }
@@ -266,6 +268,14 @@ impl Lifted {
         match self {
             Self::C(_) => glue::write_digest_unit(work, &digest),
             Self::Rust(_) => glue_rust::write_digest_unit(work, &digest),
+        }
+    }
+
+    /// Writes the unit that embeds the program's resume map to `work`, and returns its path.
+    fn write_resume_unit(&self, work: &Path) -> Result<PathBuf, String> {
+        match self {
+            Self::C(program) => glue::write_resume_unit(work, &program.resume),
+            Self::Rust(program) => glue_rust::write_resume_unit(work, &program.resume),
         }
     }
 
@@ -314,6 +324,20 @@ impl Lifted {
     }
 }
 
+/// Writes `map` to `out/resume.bin`, unless the file already holds it, and returns its path,
+/// absolute, for a unit to embed.
+pub(crate) fn write_resume_map(
+    out: &Path,
+    map: &lift::resume::ResumeMap,
+) -> Result<PathBuf, String> {
+    let file = out.join("resume.bin");
+    let bytes = map.encode();
+    if !std::fs::read(&file).is_ok_and(|have| have == bytes) {
+        std::fs::write(&file, &bytes).map_err(|error| format!("{}: {error}", file.display()))?;
+    }
+    file.canonicalize().map_err(|error| error.to_string())
+}
+
 /// The digest of the lifted code a build links: the SHA-1 of `units`, the C header beside them,
 /// the title's executable (`boot.xbe`) and `settings`. A snapshot belongs to it, so a build that
 /// only changes the runtime still resumes the snapshots of the one before.
@@ -335,6 +359,56 @@ fn code_digest(work: &Path, units: &[PathBuf], settings: &[&str]) -> Result<[u8;
         sha.update(setting.as_bytes());
     }
     Ok(sha.finalize().into())
+}
+
+/// The functions the scans find in the title's `code`: the entry point and every address that
+/// starts code, unsorted and with repeats; and the weak ones among them, which only a word in
+/// data names: a body runs on through a weak root rather than tail-calling it (see
+/// [`lift::lift_program_with_progress`]). `ANYBOX_WEAK_ROOTS=0` makes every root strong, as
+/// before.
+fn scan_roots(
+    image: &lift::Image,
+    code: &[std::ops::Range<u32>],
+    entry: u32,
+) -> (Vec<u32>, BTreeSet<u32>) {
+    let mut roots = vec![entry];
+    roots.extend(discover::prologue_starts(image, code));
+    roots.extend(discover::boundary_starts(image, code));
+    roots.extend(discover::code_addresses(image, code));
+    let named_by_data = discover::data_addresses(image, code);
+    let weak = if std::env::var("ANYBOX_WEAK_ROOTS").is_ok_and(|value| value == "0") {
+        BTreeSet::new()
+    } else {
+        let strong: BTreeSet<u32> = roots.iter().copied().collect();
+        named_by_data
+            .iter()
+            .copied()
+            .filter(|root| !strong.contains(root))
+            .collect()
+    };
+    roots.extend(named_by_data);
+    (roots, weak)
+}
+
+/// A census of the code the title on `iso` lifts to, as a build would lift it (see
+/// [`lift::census`]): its instructions, the flags they compute that nothing reads, and the
+/// sequences that recur.
+///
+/// # Errors
+///
+/// Returns a message when the disc, its executable or the signature list cannot be read.
+pub fn census(iso: &Path, runtime: &Path) -> Result<Vec<String>, String> {
+    let xbe =
+        xbe::Xbe::parse(discover::read_default_xbe(iso)?).map_err(|error| format!("{error:?}"))?;
+    let (image, code, entry) = discover::load_image(&xbe);
+    let (mut roots, mut weak) = scan_roots(&image, &code, entry);
+    let plan = plan_hooks(&xbe, &runtime.join("signatures.txt"))?;
+    let hooks: std::collections::BTreeMap<u32, u32> = plan.hooks.into_iter().collect();
+    roots.extend(hooks.keys().copied());
+    weak.retain(|root| !hooks.contains_key(root));
+    roots.sort_unstable();
+    roots.dedup();
+    Ok(lift::census::census(&image, &roots, &weak, &hooks).report())
 }
 
 /// Everything from the disc to the disk image, in `work`.
@@ -364,11 +438,7 @@ fn build_in(
         icon::write_default_icon(title_image, &icon_png, reporter)?;
     }
     let (image, code, entry) = discover::load_image(&xbe);
-    let mut roots = vec![entry];
-    roots.extend(discover::prologue_starts(&image, &code));
-    roots.extend(discover::boundary_starts(&image, &code));
-    roots.extend(discover::code_addresses(&image, &code));
-    roots.extend(discover::data_addresses(&image, &code));
+    let (mut roots, mut weak) = scan_roots(&image, &code, entry);
     // ANYBOX_TRACE_INSNS at build time builds the instruction trace into the title.
     let tracing = std::env::var_os("ANYBOX_TRACE_INSNS").is_some();
     let verbose = std::env::var_os("ANYBOX_VERBOSE").is_some();
@@ -393,6 +463,7 @@ fn build_in(
     }
     let hooks: std::collections::BTreeMap<u32, u32> = plan.hooks.into_iter().collect();
     roots.extend(hooks.keys().copied());
+    weak.retain(|root| !hooks.contains_key(root));
     roots.sort_unstable();
     roots.dedup();
     let mut lifting = Tracker::start(Phase::Lifting, reporter);
@@ -400,6 +471,7 @@ fn build_in(
         request.rust,
         &image,
         &roots,
+        &weak,
         &hooks,
         tracing,
         &mut |done, known| {
@@ -423,6 +495,7 @@ fn build_in(
     let mut units = program.write_units(iso, work, entry, name)?;
     let optimization = request.opt.as_deref().unwrap_or(OPT_LEVELS[0]);
     units.push(program.write_digest_unit(work, &units, optimization, tracing)?);
+    units.push(program.write_resume_unit(work)?);
     let level = request.pack_level.unwrap_or(DEFAULT_PACK_LEVEL);
     discpack::write_pack(iso, work, level, reporter)?;
     let game = program.compile_and_link(&units, work, library, optimization, tracing, reporter)?;

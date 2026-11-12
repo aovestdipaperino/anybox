@@ -3,7 +3,7 @@
 use super::file;
 use crate::kernel::Kernel;
 
-/// Boots the title in `xbe` from its snapshot, if it has one this build made, else from its perma
+/// Boots the title in `xbe` from its snapshot, if it has one this build can resume, else from its perma
 /// snapshot: new guest memory filled from it, a kernel booted and given its state, and a host
 /// thread for each guest thread it had running. The snapshot is consumed; the perma one stays.
 /// Returns the guest base; `None` (after saying why, and deleting a snapshot that cannot be used,
@@ -27,8 +27,8 @@ pub(crate) fn try_restore(xbe: &[u8]) -> Option<*mut u8> {
     };
     let perma = path != regular;
     // A host that cannot read the executable says nothing of the snapshot: it stays.
-    let digest = match file::executable_digest() {
-        Ok(digest) => digest,
+    let build = match file::Build::current(xbe) {
+        Ok(build) => build,
         Err(error) => {
             eprintln!(
                 "anyxbox: cannot check the snapshot against this build: {error}; booting afresh"
@@ -36,7 +36,7 @@ pub(crate) fn try_restore(xbe: &[u8]) -> Option<*mut u8> {
             return None;
         }
     };
-    let snapshot = file::decode(&bytes, title, &digest)
+    let decoded = file::decode(&bytes, title, &build, super::resume_map::current())
         .map_err(|why| {
             // A perma snapshot is kept for the bug it reproduces, even when this build cannot
             // resume it.
@@ -51,7 +51,13 @@ pub(crate) fn try_restore(xbe: &[u8]) -> Option<*mut u8> {
             }
         })
         .ok()?;
-    let booted = boot_from(snapshot, &parsed)
+    if decoded.other_build {
+        eprintln!(
+            "anyxbox: {} was made by another build of the title; its resume map has every frame",
+            path.display()
+        );
+    }
+    let booted = boot_from(decoded.snapshot, &parsed)
         .map_err(|error| eprintln!("anyxbox: {error}; booting afresh"))
         .ok()?;
     eprintln!("anyxbox: resuming from {}", path.display());
@@ -63,8 +69,8 @@ pub(crate) fn try_restore(xbe: &[u8]) -> Option<*mut u8> {
     Some(base)
 }
 
-/// Reads the running title's perma snapshot, which must be one this build made: the title can
-/// go back to it with [`rewind`].
+/// Reads the running title's perma snapshot, which must be one this build can resume: the title
+/// can go back to it with [`rewind`].
 ///
 /// # Errors
 ///
@@ -78,8 +84,11 @@ pub(crate) fn read_perma() -> Result<file::Snapshot, String> {
         std::io::ErrorKind::NotFound => "there is no perma snapshot".to_owned(),
         _ => format!("{}: {error}", path.display()),
     })?;
-    let digest = file::executable_digest()?;
-    file::decode(&bytes, title, &digest).map_err(|why| format!("{}: {why}", path.display()))
+    let xbe = crate::abi::xbe().ok_or("the title's executable is not known")?;
+    let build = file::Build::current(xbe)?;
+    file::decode(&bytes, title, &build, super::resume_map::current())
+        .map(|decoded| decoded.snapshot)
+        .map_err(|why| format!("{}: {why}", path.display()))
 }
 
 /// Takes the title back to `snapshot` after the old one has stopped (see

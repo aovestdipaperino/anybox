@@ -228,8 +228,14 @@ pub(crate) fn compile_in_parallel(
 /// `anyxbox_xbe_end` just past it. Done in assembly because an array of megabytes compiles
 /// slowly.
 pub(crate) fn embed_source(xbe: &Path) -> String {
+    embed_file(xbe, "anyxbox_xbe")
+}
+
+/// The unit that embeds the file at `file`, an absolute path, as `symbol`, with `symbol_end` just
+/// past it.
+fn embed_file(file: &Path, symbol: &str) -> String {
     // The path is quoted for the assembler, and the braces doubled for `global_asm!`'s template.
-    let path = xbe
+    let path = file
         .display()
         .to_string()
         .replace('\\', "\\\\")
@@ -238,11 +244,21 @@ pub(crate) fn embed_source(xbe: &Path) -> String {
         .replace('}', "}}");
     let incbin = format!(".incbin \"{path}\"");
     format!(
-        "{}core::arch::global_asm!(\n    \".section __DATA,__const\",\n    \".globl _anyxbox_xbe\",\n    \
-         \"_anyxbox_xbe:\",\n    {incbin:?},\n    \".globl _anyxbox_xbe_end\",\n    \"_anyxbox_xbe_end:\",\n    \
+        "{}core::arch::global_asm!(\n    \".section __DATA,__const\",\n    \".globl _{symbol}\",\n    \
+         \"_{symbol}:\",\n    {incbin:?},\n    \".globl _{symbol}_end\",\n    \"_{symbol}_end:\",\n    \
          \".text\",\n);\n",
         lift::rust::UNIT_ATTRIBUTES
     )
+}
+
+/// Writes the program's resume map (see [`lift::resume`]) to `out/resume.bin` and the unit that
+/// embeds it to `out/resume.rs`, and returns that unit.
+pub(crate) fn write_resume_unit(
+    out: &Path,
+    map: &lift::resume::ResumeMap,
+) -> Result<PathBuf, String> {
+    let file = crate::write_resume_map(out, map)?;
+    write_unit(out, "resume.rs", &embed_file(&file, "anyxbox_resume_map"))
 }
 
 /// Writes the title's executable to `out/boot.xbe` and the unit that embeds it to `out/boot.rs`,
@@ -371,6 +387,7 @@ mod tests {
         std::fs::write(&xbe, [1u8, 2, 3]).unwrap();
         units.push(write_unit(&dir, "boot.rs", &embed_source(&xbe)).unwrap());
         units.push(write_digest_unit(&dir, &[7; 20]).unwrap());
+        units.push(write_resume_unit(&dir, &program.resume).unwrap());
         let result = compile_in_parallel(&units, &["-Copt-level=0".to_owned()], &|_| {});
         std::fs::remove_dir_all(&dir).unwrap();
         result.unwrap();
@@ -393,6 +410,7 @@ mod tests {
         std::fs::write(&xbe, [1u8, 2, 3]).unwrap();
         units.push(write_unit(&dir, "boot.rs", &embed_source(&xbe)).unwrap());
         units.push(write_digest_unit(&dir, &[7; 20]).unwrap());
+        units.push(write_resume_unit(&dir, &program.resume).unwrap());
         let result = compile_and_link(
             &units,
             &dir,

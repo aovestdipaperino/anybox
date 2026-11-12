@@ -1271,15 +1271,12 @@ impl Renderer {
         let Some(mut view) = self.queue.write_buffer_with(buffer, 0, size) else {
             return;
         };
+        // A batch at a time: a copy per vertex costs more than the copying.
         let mut at = 0;
-        for vertex in plans
-            .iter()
-            .flat_map(|plan| &plan.batches)
-            .flat_map(|batch| &batch.vertices)
-        {
-            view.slice(at..at + SIZE)
-                .copy_from_slice(&vertex.to_bytes());
-            at += SIZE;
+        for batch in plans.iter().flat_map(|plan| &plan.batches) {
+            let bytes = GpuVertex::bytes(&batch.vertices);
+            view.slice(at..at + bytes.len()).copy_from_slice(bytes);
+            at += bytes.len();
         }
     }
 

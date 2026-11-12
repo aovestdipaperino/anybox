@@ -196,12 +196,65 @@ impl Gpu {
                 buffered_at = get;
             }
             let at = (get - buffered_at) as usize;
+            if self.vertex_run(get, &buffer[at..]) > 0 {
+                continue;
+            }
             let word =
                 u32::from_le_bytes([buffer[at], buffer[at + 1], buffer[at + 2], buffer[at + 3]]);
             if !self.push_word(word, get, bus) {
                 return;
             }
         }
+    }
+
+    /// Takes at once the words of a vertex-data run that `bytes` (from `get` on) holds:
+    /// `INLINE_ARRAY` pushed without incrementing, as Direct3D sends a draw's vertices, most of a
+    /// frame's words. [`Gpu::push_word`] would take them one by one with tests none of them can
+    /// change; this leaves the same state. Returns how many it took: none when the pusher is not
+    /// in such a run, or the puller could not take them.
+    fn vertex_run(&mut self, get: u32, bytes: &[u8]) -> usize {
+        let state = self.reg(CACHE1_DMA_STATE);
+        let count = (state >> 18) & 0x7FF;
+        let subchannel = (state >> 13) & 7;
+        if count < 2
+            || state & 0x1FFC != INLINE_ARRAY
+            || state & 1 == 0
+            || self.subchannels[subchannel as usize].class != KELVIN
+            || self.nop_wait
+            || self.context_wait
+            || self.reg(PGRAPH_FIFO) & 1 == 0
+            || self.reg(CACHE1_PULL0) & 1 == 0
+        {
+            return 0;
+        }
+        let taken = (count as usize).min(bytes.len() / 4);
+        let words = bytes[..4 * taken]
+            .as_chunks::<4>()
+            .0
+            .iter()
+            .map(|word| u32::from_le_bytes(*word));
+        let command = |value| Command {
+            class: KELVIN,
+            method: INLINE_ARRAY,
+            value,
+        };
+        self.stall = None;
+        for word in words.clone() {
+            self.inline.take_vertex_word(word);
+        }
+        if self.recording {
+            self.frame.extend(words.clone().map(command));
+        }
+        if let Some(probe) = &mut self.probe {
+            probe.extend(words.map(command));
+        }
+        let taken_words = u32::try_from(taken).unwrap_or(0);
+        self.set(
+            CACHE1_DMA_STATE,
+            (state & !(0x7FF << 18)) | (count - taken_words) << 18,
+        );
+        self.set(CACHE1_DMA_GET, get + 4 * taken_words);
+        taken
     }
 
     /// Handles one push-buffer word at `get`. Returns false when the pusher must stop (an error,
@@ -1142,6 +1195,59 @@ mod tests {
             .map(|c| c.value)
             .collect();
         assert_eq!(inline, [1, 2, 3, 4, 5, 6]);
+    }
+
+    #[test]
+    fn a_run_of_vertex_words_leaves_what_the_same_words_one_at_a_time_leave() {
+        // Three floats a vertex; 302 words, more than one read of the push buffer, so the run
+        // continues in a second read.
+        let vertex_words: Vec<u32> = (0..302).map(|i| 0x3F80_0000 + i).collect();
+        let draw = |one_at_a_time: bool| {
+            let bus = FlatBus::new();
+            let mut gpu = setup(&bus);
+            gpu.record_frames(true);
+            let mut words = vec![
+                methods(0, SET_OBJECT, 1),
+                0xBEEF,
+                methods(0, ARRAY_FORMAT, 1),
+                0x32,
+                methods(0, 0x17FC, 1),
+                5,
+            ];
+            if one_at_a_time {
+                for &word in &vertex_words {
+                    words.extend([methods(0, INLINE_ARRAY, 1), word]);
+                }
+            } else {
+                words.push(
+                    0x4000_0000
+                        | methods(0, INLINE_ARRAY, u32::try_from(vertex_words.len()).unwrap()),
+                );
+                words.extend(&vertex_words);
+            }
+            words.extend([methods(0, 0x17FC, 1), 0, methods(0, FLIP_STALL, 1), 0]);
+            push(&mut gpu, &bus, 0, &words);
+            let get = gpu.reg(CACHE1_DMA_GET);
+            assert_eq!(get, gpu.reg(CACHE1_DMA_PUT), "the pusher ran to the end");
+            let frames = gpu.take_frames();
+            assert_eq!(frames.len(), 1);
+            let commands: Vec<(u32, u32)> = frames[0]
+                .commands
+                .iter()
+                .map(|c| (c.method, c.value))
+                .collect();
+            (
+                commands,
+                gpu.inline.replay().len(),
+                gpu.reg(CACHE1_DMA_STATE),
+            )
+        };
+        let (run, replay, state) = draw(false);
+        assert_eq!(
+            run.iter().filter(|(m, _)| *m == INLINE_ARRAY).count(),
+            vertex_words.len()
+        );
+        assert_eq!((run, replay, state), draw(true));
     }
 
     #[test]

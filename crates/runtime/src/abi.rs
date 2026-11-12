@@ -30,6 +30,8 @@ const CALLS_PER_SLICE: u64 = 256;
 const MMIO_READS_PER_SLICE: u64 = 64;
 /// The default length of a time slice, in microseconds (`ANYXBOX_SLICE_US` overrides it).
 const SLICE_US: u64 = 250;
+/// Turns in a row of one loop that only waits before its thread gives way or sleeps.
+const SPINS_PER_WAIT: u32 = 64;
 /// The longest the scheduler sleeps before looking again.
 const IDLE_STEP: Duration = Duration::from_millis(2);
 /// A guest thread's host stack.
@@ -42,6 +44,8 @@ thread_local! {
     static MY_EPOCH: Cell<u64> = const { Cell::new(0) };
     /// Whether this host thread is counted in `LIVE`.
     static COUNTED: Cell<bool> = const { Cell::new(false) };
+    /// The loop that only waits this host thread last turned, and its turns in a row.
+    static SPINS: Cell<(u32, u32)> = const { Cell::new((0, 0)) };
 }
 
 /// Host threads that may still touch guest state: a reset waits for none (spec 7.8).
@@ -271,9 +275,18 @@ fn reschedule_with(mut guard: MutexGuard<'static, Option<Kernel>>, me: u32, held
         let ticks = wake.saturating_sub(kernel.clock.now());
         let wait = Duration::from_nanos(ticks.saturating_mul(100)).min(IDLE_STEP);
         drop(guard);
-        std::thread::sleep(wait);
+        guest_sleep(wait);
         guard = lock();
     }
+}
+
+/// Sleeps the thread that holds the baton, so no guest code runs: counted for `ANYXBOX_FPS`.
+fn guest_sleep(wait: Duration) {
+    std::thread::sleep(wait);
+    crate::render::GUEST_ASLEEP_NS.fetch_add(
+        u64::try_from(wait.as_nanos()).unwrap_or(u64::MAX),
+        Ordering::Relaxed,
+    );
 }
 
 /// Boots the title from the embedded XBE (spec 5.1, 6.3, 6.4). Installs the host fault handler,
@@ -879,7 +892,7 @@ fn pace(mut guard: MutexGuard<'static, Option<Kernel>>) {
             reschedule_with(guard, me, true);
         } else {
             drop(guard);
-            std::thread::sleep(
+            guest_sleep(
                 deadline
                     .saturating_duration_since(Instant::now())
                     .min(Duration::from_millis(1)),
@@ -926,6 +939,67 @@ pub extern "C" fn anyxbox_preempt() {
         }
         reschedule(guard, me);
     }
+}
+
+/// Called by lifted code on each turn of a loop that only waits (it reads memory and writes none,
+/// so only another thread, a DPC, a timer or the GPU can end it), at its backward branch `site`.
+/// After [`SPINS_PER_WAIT`] turns in a row, services time and lets another ready thread of equal
+/// or higher priority run at once; with none ready, sleeps until the next wait, timer or vertical
+/// blank is due, at most a time slice, which is what the spinning would have come to. The slice's
+/// preempt flag is honoured as at any loop. `ANYXBOX_SPIN=0` keeps the turns spinning.
+#[unsafe(no_mangle)]
+pub extern "C" fn anyxbox_spin(site: u32) {
+    let turns = SPINS.with(|spins| {
+        let (last, turns) = spins.get();
+        let turns = if last == site { turns + 1 } else { 0 };
+        spins.set((site, turns));
+        turns
+    });
+    let waited = turns >= SPINS_PER_WAIT && spin_waits();
+    if !waited {
+        if anyxbox_preempt_flag.load(Ordering::Relaxed) != 0 {
+            anyxbox_preempt();
+        }
+        return;
+    }
+    SPINS.with(|spins| spins.set((site, 0)));
+    anyxbox_preempt_flag.store(0, Ordering::Relaxed);
+    leave_if_reset();
+    let me = ME.get();
+    let mut guard = lock();
+    if crate::hibernate::freezing() && guard.is_some() {
+        drop(park_for_hibernation(guard, me, Park::Poll));
+        return;
+    }
+    let Some(kernel) = guard.as_mut() else {
+        return;
+    };
+    kernel.service_time();
+    start_host_threads(kernel);
+    if kernel.threads.ready_at_slice_end(me) {
+        if let Some(thread) = kernel.threads.get_mut(me) {
+            thread.resume = 0;
+            thread.park = Park::Poll;
+        }
+        reschedule(guard, me);
+        return;
+    }
+    let now = kernel.clock.now();
+    let due = kernel
+        .next_wake()
+        .map_or(kernel.next_vblank, |wake| wake.min(kernel.next_vblank));
+    let wait = Duration::from_nanos(due.saturating_sub(now).saturating_mul(100))
+        .min(Duration::from_micros(slice_us()));
+    drop(guard);
+    if !wait.is_zero() {
+        guest_sleep(wait);
+    }
+}
+
+/// Whether loops that only wait give way and sleep: unless `ANYXBOX_SPIN=0`, read once.
+fn spin_waits() -> bool {
+    static WAITS: OnceLock<bool> = OnceLock::new();
+    *WAITS.get_or_init(|| std::env::var("ANYXBOX_SPIN").map_or(true, |value| value != "0"))
 }
 
 /// Called by the lifted code when it traps: with `ANYXBOX_DUMP=ADDR:LEN,...` (hex), prints the

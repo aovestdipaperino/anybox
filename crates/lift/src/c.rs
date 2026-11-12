@@ -6,6 +6,8 @@ use std::fmt::Write as _;
 
 use iced_x86::{FlowControl, Instruction, Mnemonic, OpKind, Register};
 
+use crate::resume::{KIND_SETJMP, ResumeMap};
+
 use super::{
     Discovered, Image, LiftError, Root, addr, condition_code, find_setjmps, is_tail_call,
     unsupported, walk,
@@ -56,6 +58,11 @@ static void lift_trap(uint32_t at, const char *what) {
 extern volatile int anyxbox_preempt_flag;
 void anyxbox_preempt(void);
 #define LIFT_POLL(s) do { if (__builtin_expect(anyxbox_preempt_flag, 0)) { LIFT_SITE(s, LIFT_K_POLL); anyxbox_preempt(); } } while (0)
+/* The backward branch of a loop that only waits (reads memory, writes none): it can end only when
+   something else changes memory. The runtime counts its turns and, after many in a row, lets
+   another thread run or sleeps until something is due, where the loop would only have spun. */
+void anyxbox_spin(uint32_t site);
+#define LIFT_SPIN(s) do { LIFT_SITE(s, LIFT_K_POLL); anyxbox_spin(s); } while (0)
 /* A jump to another function's entry is a tail call, so a loop that runs through several functions
    keeps one host frame, even unoptimized. A function that holds a `setjmp` context calls and
    returns instead: its frame must outlive the jump. `s` is the site, for that call. */
@@ -171,7 +178,7 @@ static inline void lift_jmp_register(lift_jmp *j, uint32_t buf, uint32_t resume,
         j->active = 1;
     }
 }
-/* While resuming a frame: the saved context of `setjmp` site `site` in it, if it had one. */
+/* While resuming a frame: the saved context of the `setjmp` call at `site` in it, if it had one. */
 static int lift_resume_jmp(uint32_t site, uint32_t *buf, uint32_t *resume) {
     for (uint32_t i = 0; i < lift_jmp_restore_count; i++) {
         lift_jmp_saved *s = &lift_jmp_restore[i];
@@ -826,6 +833,8 @@ pub struct Program {
     /// The functions that could not be lifted. Each has a stub that traps with the reason when it
     /// runs.
     pub failures: Vec<LiftError>,
+    /// Every place a hibernated thread can be resumed at.
+    pub resume: ResumeMap,
 }
 
 impl Program {
@@ -882,15 +891,17 @@ pub fn lift_program(
     hooks: &BTreeMap<u32, u32>,
     trace: bool,
 ) -> Program {
-    lift_program_with_progress(image, roots, hooks, trace, &mut |_, _| {})
+    lift_program_with_progress(image, roots, &BTreeSet::new(), hooks, trace, &mut |_, _| {})
 }
 
-/// [`lift_program`], calling `progress` after each function with how many are done and how many
-/// are known so far. The second grows as lifted functions name callees not seen before.
+/// [`lift_program`], with the roots in `weak` copied into the bodies that reach them rather than
+/// tail-called (see `walk`), calling `progress` after each function with how many are done and how
+/// many are known so far. The second grows as lifted functions name callees not seen before.
 #[must_use]
 pub fn lift_program_with_progress(
     image: &Image,
     roots: &[u32],
+    weak: &BTreeSet<u32>,
     hooks: &BTreeMap<u32, u32>,
     trace: bool,
     progress: &mut dyn FnMut(usize, usize),
@@ -899,17 +910,30 @@ pub fn lift_program_with_progress(
     let mut prototypes = String::new();
     let mut bodies = Vec::new();
     let mut traps = Vec::new();
-    let walked = walk(image, roots, hooks, progress, &mut |function, root| {
-        writeln!(prototypes, "void fn_{function:08x}(void);").unwrap();
-        bodies.push(match root {
-            Root::Hooked(trap) => format!(
+    let mut resume = ResumeMap::default();
+    let walked = walk(
+        image,
+        roots,
+        weak,
+        hooks,
+        progress,
+        &mut |function, root| {
+            writeln!(prototypes, "void fn_{function:08x}(void);").unwrap();
+            bodies.push(match root {
+            Root::Hooked(trap) => {
+                resume.insert(function, function, 1);
+                format!(
                 "void fn_{function:08x}(void) {{ LIFT_ENTER({function:#010x}u); \
                  if (LIFT_RESUMING()) {{ lift_resume_call(); return; }} \
                  LIFT_IN({function:#010x}u, LIFT_K_RET, rt_call({trap:#010x}u, {function:#010x}u)); }}\n"
-            ),
+                )
+            }
             Root::Lifted(found) => {
                 let body = lift_function(function, &found, &setjmps, trace);
                 traps.extend(body.traps);
+                for (site, kind) in body.resume {
+                    resume.insert(function, site, kind);
+                }
                 body.c
             }
             Root::Failed(error) => {
@@ -917,7 +941,8 @@ pub fn lift_program_with_progress(
                 format!("void fn_{function:08x}(void) {{ {trap} }}\n")
             }
         });
-    });
+        },
+    );
     let dispatch = dispatcher(&walked.lifted);
     Program {
         prototypes,
@@ -926,6 +951,7 @@ pub fn lift_program_with_progress(
         lifted: walked.lifted.len(),
         traps,
         failures: walked.failures,
+        resume,
     }
 }
 
@@ -1023,6 +1049,8 @@ struct Body {
     c: String,
     /// Places in the function the lifter could not translate; each traps if it runs.
     traps: Vec<LiftError>,
+    /// The sites a resume can re-enter it at, and its `setjmp` calls, each with its kind.
+    resume: Vec<(u32, u32)>,
 }
 
 /// A C statement that stops the program at `address` with `message`.
@@ -1092,12 +1120,24 @@ fn lift_function(entry: u32, found: &Discovered, setjmps: &BTreeSet<u32>, trace:
             setjmp_addresses.push(address);
             setjmp_sites - 1
         });
+        // A backward branch within the body that closes a loop that only waits.
+        let waits = matches!(
+            flow,
+            FlowControl::ConditionalBranch | FlowControl::UnconditionalBranch
+        ) && matches!(
+            instruction.op0_kind(),
+            OpKind::NearBranch32 | OpKind::NearBranch64
+        ) && {
+            let target = addr(instruction.near_branch_target());
+            target <= address && body_set.contains(&target) && found.only_waits(target, address)
+        };
         let statement = match emit(
             &instruction,
             address,
             &body_set,
             tables.get(&address),
             setjmp_site,
+            waits,
         ) {
             Ok(statement) => statement,
             Err(error) => {
@@ -1110,6 +1150,7 @@ fn lift_function(entry: u32, found: &Discovered, setjmps: &BTreeSet<u32>, trace:
             ("LIFT_K_CALL", Site::Call),
             ("LIFT_K_RET", Site::Ret),
             ("LIFT_POLL(", Site::Poll),
+            ("LIFT_SPIN(", Site::Poll),
         ] {
             if statement.contains(marker) {
                 sites.insert((address, site));
@@ -1158,7 +1199,16 @@ fn lift_function(entry: u32, found: &Discovered, setjmps: &BTreeSet<u32>, trace:
     }
     declarations.push_str(&resume_prologue(entry, &sites, &setjmp_addresses));
     c.insert_str(declarations_at, &declarations);
-    Body { c, traps }
+    let resume = sites
+        .iter()
+        .map(|&(address, site)| (address, site.code()))
+        .chain(
+            setjmp_addresses
+                .iter()
+                .map(|&address| (address, KIND_SETJMP)),
+        )
+        .collect();
+    Body { c, traps, resume }
 }
 
 /// The kind of site a host frame can be resumed at.
@@ -1181,18 +1231,27 @@ impl Site {
             Self::Poll => "LIFT_K_POLL",
         }
     }
+
+    /// The `LIFT_K_*` value.
+    fn code(self) -> u32 {
+        match self {
+            Self::Call => 0,
+            Self::Ret => 1,
+            Self::Poll => 2,
+        }
+    }
 }
 
 /// The prologue that resumes a function at a site: it registers the function's `setjmp` contexts
-/// again (the call at `setjmps[i]` holds context `i`), then calls down to, or goes on from, the
-/// site its frame record names.
+/// again (the call at `setjmps[i]` holds context `i`, saved under that call's address), then calls
+/// down to, or goes on from, the site its frame record names.
 fn resume_prologue(entry: u32, sites: &BTreeSet<(u32, Site)>, setjmps: &[u32]) -> String {
     let mut c = String::from("    if (LIFT_RESUMING()) {\n");
     for (index, address) in setjmps.iter().enumerate() {
         writeln!(
             c,
-            "        {{ uint32_t b, r; if (lift_resume_jmp({index}u, &b, &r)) {{ \
-             lift_jmp_register(&lj{index}, b, r, {index}u); \
+            "        {{ uint32_t b, r; if (lift_resume_jmp({address:#010x}u, &b, &r)) {{ \
+             lift_jmp_register(&lj{index}, b, r, {address:#010x}u); \
              if (sigsetjmp(lj{index}.env, 0)) goto C_{address:08x}; }} }}"
         )
         .unwrap();
@@ -1411,6 +1470,7 @@ fn emit(
     body: &BTreeSet<u32>,
     table: Option<&Vec<(u32, u32)>>,
     setjmp_site: Option<usize>,
+    waits: bool,
 ) -> Result<String, LiftError> {
     #[allow(clippy::enum_glob_use)]
     use Mnemonic::*;
@@ -1436,8 +1496,9 @@ fn emit(
                 let target = addr(instruction.near_branch_target());
                 if body.contains(&target) {
                     if target <= address {
+                        let poll = if waits { "LIFT_SPIN" } else { "LIFT_POLL" };
                         format!(
-                            "if (cond({code})) {{ LIFT_POLL({address:#010x}u); P_{address:08x}:; goto L_{target:08x}; }}"
+                            "if (cond({code})) {{ {poll}({address:#010x}u); P_{address:08x}:; goto L_{target:08x}; }}"
                         )
                     } else {
                         format!("if (cond({code})) goto L_{target:08x};")
@@ -1858,7 +1919,7 @@ fn emit(
                     // A `longjmp` to it arrives at the `else`, with the registers and EAX already
                     // set by the title's own code, and the next instruction runs.
                     Some(index) => format!(
-                        "push32({next}u); lift_jmp_register(&lj{index}, rd32(R_ESP + 4u), {next}u, {index}u); \
+                        "push32({next}u); lift_jmp_register(&lj{index}, rd32(R_ESP + 4u), {next}u, {address:#010x}u); \
                          if (sigsetjmp(lj{index}.env, 0) == 0) {{ LIFT_IN({address:#010x}u, LIFT_K_CALL, fn_{target:08x}()); }} \
                          C_{address:08x}:;"
                     ),
@@ -1912,7 +1973,8 @@ fn emit(
             let target = addr(instruction.near_branch_target());
             if body.contains(&target) {
                 if target <= address {
-                    format!("LIFT_POLL({address:#010x}u); P_{address:08x}:; goto L_{target:08x};")
+                    let poll = if waits { "LIFT_SPIN" } else { "LIFT_POLL" };
+                    format!("{poll}({address:#010x}u); P_{address:08x}:; goto L_{target:08x};")
                 } else {
                     format!("goto L_{target:08x};")
                 }

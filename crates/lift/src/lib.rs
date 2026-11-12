@@ -86,7 +86,10 @@ impl std::fmt::Display for LiftError {
 impl std::error::Error for LiftError {}
 
 pub mod c;
+pub mod census;
+pub mod resume;
 pub mod rust;
+mod wait;
 
 pub use c::{PRELUDE, Program, lift, lift_program, lift_program_with_progress};
 
@@ -254,14 +257,23 @@ pub(crate) struct Walked {
 /// Walks the functions reachable from `roots`, each root and every function it calls directly,
 /// and hands each to `emit`. `progress` hears after each function how many are done and how many
 /// are known so far; the second grows as lifted functions name callees not seen before.
+///
+/// A root in `weak` is one the scans only guessed at, a word in data that looks like a code
+/// address, and most of those land inside another function. A body runs on through a weak root,
+/// holding a copy of its code, rather than tail-calling it and so cutting a function in two at a
+/// guess. A weak root's own function still stops at every other root, weak or strong, as all
+/// functions once did: so the weak roots' functions split the code between them, and no
+/// instruction is copied more than once more, however many weak roots a function holds.
 pub(crate) fn walk(
     image: &Image,
     roots: &[u32],
+    weak: &BTreeSet<u32>,
     hooks: &BTreeMap<u32, u32>,
     progress: &mut dyn FnMut(usize, usize),
     emit: &mut dyn FnMut(u32, Root),
 ) -> Walked {
     let entries: BTreeSet<u32> = roots.iter().copied().collect();
+    let strong: BTreeSet<u32> = entries.difference(weak).copied().collect();
     let mut lifted = BTreeSet::new();
     let mut failed = BTreeSet::new();
     let mut failures = Vec::new();
@@ -277,7 +289,12 @@ pub(crate) fn walk(
             emit(function, Root::Hooked(trap));
             continue;
         }
-        match discover(image, function, &entries, hooks) {
+        let stops = if weak.contains(&function) {
+            &entries
+        } else {
+            &strong
+        };
+        match discover(image, function, stops, hooks) {
             Ok(found) => {
                 lifted.insert(function);
                 known.extend(found.callees.iter().copied());

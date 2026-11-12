@@ -6,6 +6,8 @@ use std::fmt::Write as _;
 
 use iced_x86::{FlowControl, Instruction, Mnemonic, OpKind, Register};
 
+use crate::resume::{KIND_SETJMP, ResumeMap};
+
 use super::{
     Discovered, Image, LiftError, Root, addr, condition_code, falls_through, find_setjmps,
     is_setjmp_call, is_tail_call, unsupported, walk,
@@ -75,6 +77,8 @@ pub struct Program {
     /// The functions that could not be lifted. Each has a stub that traps with the reason when it
     /// runs.
     pub failures: Vec<LiftError>,
+    /// Every place a hibernated thread can be resumed at.
+    pub resume: ResumeMap,
 }
 
 impl Program {
@@ -161,15 +165,17 @@ pub fn lift_program(
     hooks: &BTreeMap<u32, u32>,
     trace: bool,
 ) -> Program {
-    lift_program_with_progress(image, roots, hooks, trace, &mut |_, _| {})
+    lift_program_with_progress(image, roots, &BTreeSet::new(), hooks, trace, &mut |_, _| {})
 }
 
-/// [`lift_program`], calling `progress` after each function with how many are done and how many
-/// are known so far. The second grows as lifted functions name callees not seen before.
+/// [`lift_program`], with the roots in `weak` copied into the bodies that reach them rather than
+/// tail-called (see `walk`), calling `progress` after each function with how many are done and how
+/// many are known so far. The second grows as lifted functions name callees not seen before.
 #[must_use]
 pub fn lift_program_with_progress(
     image: &Image,
     roots: &[u32],
+    weak: &BTreeSet<u32>,
     hooks: &BTreeMap<u32, u32>,
     trace: bool,
     progress: &mut dyn FnMut(usize, usize),
@@ -177,45 +183,60 @@ pub fn lift_program_with_progress(
     let setjmps = find_setjmps(image);
     let mut functions = Vec::new();
     let mut traps = Vec::new();
-    let walked = walk(image, roots, hooks, progress, &mut |function, root| {
-        let (rust, calls) = match root {
-            Root::Hooked(trap) => (
-                format!(
-                    "#[unsafe(no_mangle)]\npub unsafe extern \"C\" fn fn_{function:08x}(c: *mut Cpu) -> Next {{\n    \
+    let mut resume = ResumeMap::default();
+    let walked = walk(
+        image,
+        roots,
+        weak,
+        hooks,
+        progress,
+        &mut |function, root| {
+            let (rust, calls) = match root {
+                Root::Hooked(trap) => {
+                    resume.insert(function, function, 1);
+                    (
+                        format!(
+                            "#[unsafe(no_mangle)]\npub unsafe extern \"C\" fn fn_{function:08x}(c: *mut Cpu) -> Next {{\n    \
                      unsafe {{\n        enter(c, {function:#010x});\n        \
                      if (*c).resuming != 0 {{\n            resume_call(c);\n            return END;\n        }}\n        \
                      call_rt(c, {function:#010x}, K_RET, {trap:#010x}, {function:#010x});\n        END\n    }}\n}}\n"
-                ),
-                BTreeSet::new(),
-            ),
-            Root::Lifted(found) => {
-                let body = lift_function(function, &found, &setjmps, trace);
-                traps.extend(body.traps);
-                (body.rust, body.calls)
-            }
-            Root::Failed(error) => {
-                let trap = trap_statement(function, &error.message);
-                (
-                    format!(
-                        "#[unsafe(no_mangle)]\npub unsafe extern \"C\" fn fn_{function:08x}(c: *mut Cpu) -> Next {{\n    \
+                        ),
+                        BTreeSet::new(),
+                    )
+                }
+                Root::Lifted(found) => {
+                    let body = lift_function(function, &found, &setjmps, trace);
+                    traps.extend(body.traps);
+                    for (site, kind) in body.resume {
+                        resume.insert(function, site, kind);
+                    }
+                    (body.rust, body.calls)
+                }
+                Root::Failed(error) => {
+                    let trap = trap_statement(function, &error.message);
+                    (
+                        format!(
+                            "#[unsafe(no_mangle)]\npub unsafe extern \"C\" fn fn_{function:08x}(c: *mut Cpu) -> Next {{\n    \
                          unsafe {{ {trap} }}\n}}\n"
-                    ),
-                    BTreeSet::new(),
-                )
-            }
-        };
-        functions.push(Function {
-            address: function,
-            rust,
-            calls,
-        });
-    });
+                        ),
+                        BTreeSet::new(),
+                    )
+                }
+            };
+            functions.push(Function {
+                address: function,
+                rust,
+                calls,
+            });
+        },
+    );
     Program {
         functions,
         lifted: walked.lifted.len(),
         found: walked.lifted,
         traps,
         failures: walked.failures,
+        resume,
     }
 }
 
@@ -261,6 +282,8 @@ struct Body {
     calls: BTreeSet<u32>,
     /// Places in the function the lifter could not translate; each traps if it runs.
     traps: Vec<LiftError>,
+    /// The sites a resume can re-enter it at, and its `setjmp` calls, each with its kind.
+    resume: Vec<(u32, u32)>,
 }
 
 /// A Rust statement that stops the program at `address` with `message`.
@@ -426,12 +449,20 @@ fn lift_function(entry: u32, found: &Discovered, setjmps: &BTreeSet<u32>, trace:
         )
         .unwrap();
     }
-    let resume = resume_prologue(&mut emitter, entry);
+    // The sites the prologue resumes at, before it adds the ones its own jumps make.
+    let resume_sites = emitter
+        .sites
+        .keys()
+        .map(|&(address, site)| (address, site.kind()))
+        .chain(setjmp_calls.iter().map(|&address| (address, KIND_SETJMP)))
+        .collect();
+    let resume = resume_prologue(&mut emitter, entry, &setjmp_calls);
     let rust = function_rust(entry, &resume, &arms, &emitter.chunks, setjmp_calls.len());
     Body {
         rust,
         calls: emitter.calls,
         traps,
+        resume: resume_sites,
     }
 }
 
@@ -515,7 +546,7 @@ enum Site {
 
 impl Site {
     /// The prelude's `K_*` value.
-    fn kind(self) -> u64 {
+    fn kind(self) -> u32 {
         match self {
             Self::Call => 0,
             Self::Ret => 1,
@@ -630,13 +661,14 @@ impl Emitter<'_> {
 }
 
 /// The prologue that resumes a function at a site: it registers the function's `setjmp` contexts
-/// again, then calls down to, or goes on from, the site its frame record names.
-fn resume_prologue(emitter: &mut Emitter, entry: u32) -> String {
+/// again (context `i` is the `setjmp` call at `setjmp_calls[i]`, saved under that call's address),
+/// then calls down to, or goes on from, the site its frame record names.
+fn resume_prologue(emitter: &mut Emitter, entry: u32, setjmp_calls: &[u32]) -> String {
     let mut rust = String::from("        if (*c).resuming != 0 {\n");
-    for index in 0..emitter.landings.len() {
+    for (index, address) in setjmp_calls.iter().enumerate() {
         writeln!(
             rust,
-            "            jmp_reregister(c, lj.at({index}), {index});"
+            "            jmp_reregister(c, lj.at({index}), {address:#010x});"
         )
         .unwrap();
     }
@@ -655,7 +687,7 @@ fn resume_prologue(emitter: &mut Emitter, entry: u32) -> String {
                 format!("if resume_poll(c) {{ return END; }} {go}")
             }
         };
-        let key = (u64::from(address) << 2) | site.kind();
+        let key = (u64::from(address) << 2) | u64::from(site.kind());
         writeln!(rust, "                    {key:#x} => {{ {action} }}").unwrap();
     }
     writeln!(
@@ -1310,7 +1342,7 @@ fn emit(
                     // set by the title's own code.
                     Some(index) => format!(
                         "push32(c, {next:#010x}); \
-                         jmp_register(c, lj.at({index}), rd32((*c).esp.wrapping_add(4)), {next:#010x}, {index}); {call}"
+                         jmp_register(c, lj.at({index}), rd32((*c).esp.wrapping_add(4)), {next:#010x}, {address:#010x}); {call}"
                     ),
                     None => format!("push32(c, {next:#010x}); {call}"),
                 }

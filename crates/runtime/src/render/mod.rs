@@ -15,7 +15,9 @@ pub mod stages;
 pub use dump::dump_next;
 
 use std::path::PathBuf;
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::mpsc::{Receiver, SyncSender};
+use std::time::{Duration, Instant};
 
 use crate::gpu::Command;
 use crate::gpu::draw::{self, Primitive};
@@ -24,8 +26,91 @@ use gpu::{Image, Renderer, TextureData};
 /// A finished frame on its way to the renderer: its commands and bound textures.
 pub type FrameJob = (Vec<Command>, Vec<TextureData>);
 
-/// A frame the GPU model has made into primitives, on its way to be drawn.
-type Modelled = (Vec<Command>, Vec<TextureData>, Vec<Primitive>);
+/// A frame the GPU model has made into primitives, on its way to be drawn, with how long the
+/// model waited for it and then took over it.
+type Modelled = (Vec<Command>, Vec<TextureData>, Vec<Primitive>, Times);
+
+/// How long a thread waited for a frame, and how long it then took over it.
+#[derive(Debug, Clone, Copy, Default)]
+struct Times {
+    idle: Duration,
+    busy: Duration,
+}
+
+impl std::ops::AddAssign for Times {
+    fn add_assign(&mut self, other: Self) {
+        self.idle += other.idle;
+        self.busy += other.busy;
+    }
+}
+
+/// For [`Rate`], from the kernel's side: the 3D frames the title finished, those dropped because
+/// the model was still behind, and the time the thread holding the baton slept (held for the
+/// next frame, or nothing to run, or a loop that only waits), when no guest code ran.
+pub(crate) static TITLE_FRAMES: AtomicU64 = AtomicU64::new(0);
+pub(crate) static DROPPED_FRAMES: AtomicU64 = AtomicU64::new(0);
+pub(crate) static GUEST_ASLEEP_NS: AtomicU64 = AtomicU64::new(0);
+
+/// With `ANYXBOX_FPS` set, a line on standard error every two seconds: the frames a second, and
+/// for the model and the renderer the time each took over a frame and waited for one. The thread
+/// that never waits is the one that holds the frame rate back.
+#[derive(Debug)]
+struct Rate {
+    since: Instant,
+    frames: u32,
+    model: Times,
+    render: Times,
+}
+
+impl Rate {
+    fn from_env() -> Option<Self> {
+        for count in [&TITLE_FRAMES, &DROPPED_FRAMES, &GUEST_ASLEEP_NS] {
+            count.store(0, Ordering::Relaxed);
+        }
+        std::env::var_os("ANYXBOX_FPS").map(|_| Self {
+            since: Instant::now(),
+            frames: 0,
+            model: Times::default(),
+            render: Times::default(),
+        })
+    }
+
+    fn frame(&mut self, model: Times, render: Times) {
+        self.frames += 1;
+        self.model += model;
+        self.render += render;
+        let elapsed = self.since.elapsed();
+        if elapsed < Duration::from_secs(2) {
+            return;
+        }
+        let each = |d: Duration| d.as_secs_f64() * 1000.0 / f64::from(self.frames);
+        let seconds = elapsed.as_secs_f64();
+        let title = TITLE_FRAMES.swap(0, Ordering::Relaxed);
+        let dropped = DROPPED_FRAMES.swap(0, Ordering::Relaxed);
+        let asleep = Duration::from_nanos(GUEST_ASLEEP_NS.swap(0, Ordering::Relaxed));
+        // The guest's time a frame of the title's: what it ran, and what it slept.
+        let per_title_frame = |d: Duration| d.as_secs_f64() * 1000.0 / (title.max(1) as f64);
+        eprintln!(
+            "anyxbox: {:.1} frames/s; title {:.1} frames/s ({dropped} dropped), guest {:.1} ms \
+             a frame (asleep {:.1}); model {:.1} ms (waiting {:.1}), renderer {:.1} ms \
+             (waiting {:.1})",
+            f64::from(self.frames) / seconds,
+            title as f64 / seconds,
+            per_title_frame(elapsed.saturating_sub(asleep)),
+            per_title_frame(asleep),
+            each(self.model.busy),
+            each(self.model.idle),
+            each(self.render.busy),
+            each(self.render.idle),
+        );
+        *self = Self {
+            since: Instant::now(),
+            frames: 0,
+            model: Times::default(),
+            render: Times::default(),
+        };
+    }
+}
 
 /// Starts the renderer thread when something takes its frames: the window, and `ANYXBOX_FRAMES`
 /// (spec 12.5), which writes every `ANYXBOX_FRAMES_EVERY`th rendered frame (30) as
@@ -62,11 +147,21 @@ pub fn start(window: bool) -> Option<SyncSender<FrameJob>> {
     std::thread::Builder::new()
         .name("anyxbox-model".to_owned())
         .spawn(move || {
+            let mut waiting = Instant::now();
             for (commands, textures) in receiver {
+                let start = Instant::now();
                 let primitives = draw::primitives(&commands);
-                if modelled.send((commands, textures, primitives)).is_err() {
+                let times = Times {
+                    idle: start - waiting,
+                    busy: start.elapsed(),
+                };
+                if modelled
+                    .send((commands, textures, primitives, times))
+                    .is_err()
+                {
                     return;
                 }
+                waiting = Instant::now();
             }
         })
         .ok()?;
@@ -95,7 +190,20 @@ fn render_frames(receiver: &Receiver<Modelled>, window: bool, files: Option<&(Pa
     let mut no_layer = false;
     let mut since_snapshot = SNAPSHOT_EVERY;
     let (mut sequence, mut drawn, mut written) = (0u64, 0u64, 0u64);
-    while let Ok((commands, textures, primitives)) = receiver.recv() {
+    let mut rate = Rate::from_env();
+    // The frame before: when its drawing started, how long the renderer waited for it, and the
+    // model's times for it.
+    let mut last: Option<(Instant, Duration, Times)> = None;
+    loop {
+        if let (Some(rate), Some((start, idle, model))) = (&mut rate, last.take()) {
+            let busy = start.elapsed();
+            rate.frame(model, Times { idle, busy });
+        }
+        let waiting = Instant::now();
+        let Ok((commands, textures, primitives, model)) = receiver.recv() else {
+            break;
+        };
+        last = Some((Instant::now(), waiting.elapsed(), model));
         sequence += 1;
         dumps.frame(sequence, &commands, &textures);
         // A frame of clears alone is drawn, so the target is cleared, but not shown: the title's

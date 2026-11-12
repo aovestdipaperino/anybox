@@ -1116,6 +1116,18 @@ fn a_setjmp_context_survives_a_resume() {
         false,
     );
     assert!(program.failures.is_empty() && program.traps.is_empty());
+    // The map names the `setjmp` call, the kernel call the thread freezes in, and the hooked
+    // function's own site, all by guest address.
+    for (function, site, kind) in [
+        (JMP_CALLER, JMP_CALLER + 5, lift::resume::KIND_SETJMP),
+        (JMP_CALLER, JMP_CALLER + 17, 0),
+        (NATIVE, NATIVE, 1),
+    ] {
+        assert!(
+            program.resume.contains(function, site, kind),
+            "{function:#x} {site:#x} {kind}"
+        );
+    }
     let main = resume_harness(
         "fn main() { unsafe { let mut r = both_runs(fn_00001080, 0); if r == 0 && (*CPU).eax != 7 { r = 6; } std::process::exit(r); } }\n",
     );

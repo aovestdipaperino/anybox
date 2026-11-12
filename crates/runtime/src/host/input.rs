@@ -1,5 +1,9 @@
 //! The controller from the keyboard, and scripted presses and holds (spec 12.2).
 
+use std::sync::Mutex;
+use std::sync::atomic::{AtomicBool, AtomicU16, Ordering};
+use std::time::Duration;
+
 use minifb::Key;
 
 /// Digital buttons.
@@ -101,6 +105,179 @@ pub fn from_keys(keys: &[Key]) -> Pad {
         axis(keys, Key::K, Key::I),
     ];
     pad
+}
+
+/// A -1.0..=1.0 stick axis as the controller's signed axis.
+#[allow(clippy::cast_possible_truncation, clippy::cast_sign_loss)]
+fn stick16(v: f32) -> i16 {
+    (v * f32::from(i16::MAX)).round() as i16
+}
+
+/// The controller a physical pad's state makes: the Switch names onto the Xbox layout, with L and
+/// R as White and Black, ZL and ZR as the triggers, and Plus and Minus as Start and Back. Home and
+/// Capture have no Xbox equivalent: they are the console's shortcuts instead (see [`Shortcut`]).
+#[must_use]
+pub fn from_state(state: &rumblepad::State) -> Pad {
+    use rumblepad::btn;
+    let mut pad = Pad::default();
+    for (mask, bit) in [
+        (btn::UP, UP),
+        (btn::DOWN, DOWN),
+        (btn::LEFT, LEFT),
+        (btn::RIGHT, RIGHT),
+        (btn::PLUS, START),
+        (btn::MINUS, BACK),
+        (btn::LSTICK, LEFT_THUMB),
+        (btn::RSTICK, RIGHT_THUMB),
+    ] {
+        if state.pressed(mask) {
+            pad.buttons |= bit;
+        }
+    }
+    for (mask, index) in [
+        (btn::A, A),
+        (btn::B, B),
+        (btn::X, X),
+        (btn::Y, Y),
+        (btn::L, WHITE),
+        (btn::R, BLACK),
+        (btn::ZL, LEFT_TRIGGER),
+        (btn::ZR, RIGHT_TRIGGER),
+    ] {
+        if state.pressed(mask) {
+            pad.analog[index] = 255;
+        }
+    }
+    pad.sticks = [
+        stick16(state.left.0),
+        stick16(state.left.1),
+        stick16(state.right.0),
+        stick16(state.right.1),
+    ];
+    pad
+}
+
+/// The controller a connected physical pad is holding, and whether one is there at all.
+static GAMEPAD: Mutex<(Pad, bool)> = Mutex::new((
+    Pad {
+        buttons: 0,
+        analog: [0; 8],
+        sticks: [0; 4],
+    },
+    false,
+));
+
+/// The controller the physical pad holds, and whether one is connected.
+#[must_use]
+pub fn held() -> (Pad, bool) {
+    *GAMEPAD
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner)
+}
+
+/// The rumble the title last asked for, as two `0..=0xFFFF` magnitudes.
+static STRONG: AtomicU16 = AtomicU16::new(0);
+static WEAK: AtomicU16 = AtomicU16::new(0);
+
+/// A console action the pad's spare buttons ask for, outside the title's controller.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Shortcut {
+    /// Capture (the 8BitDo's Star): take a perma snapshot.
+    Snapshot,
+    /// Home (Xbox's Guide, which the title never sees): back to the perma snapshot.
+    Rewind,
+}
+
+/// Shortcuts pressed on the pad and not yet taken by the window.
+static SNAPSHOT_PRESSED: AtomicBool = AtomicBool::new(false);
+static REWIND_PRESSED: AtomicBool = AtomicBool::new(false);
+
+/// The shortcuts whose buttons went down between two pad states: a press, not a hold, so holding
+/// Capture takes one snapshot.
+fn shortcuts(before: u32, now: u32) -> impl Iterator<Item = Shortcut> {
+    let down = now & !before;
+    [
+        (rumblepad::btn::CAPTURE, Shortcut::Snapshot),
+        (rumblepad::btn::HOME, Shortcut::Rewind),
+    ]
+    .into_iter()
+    .filter(move |(mask, _)| down & mask != 0)
+    .map(|(_, shortcut)| shortcut)
+}
+
+/// The shortcut pressed on the pad since the last call, if any; taken. A snapshot comes first.
+#[must_use]
+pub fn take_shortcut() -> Option<Shortcut> {
+    if SNAPSHOT_PRESSED.swap(false, Ordering::Relaxed) {
+        Some(Shortcut::Snapshot)
+    } else if REWIND_PRESSED.swap(false, Ordering::Relaxed) {
+        Some(Shortcut::Rewind)
+    } else {
+        None
+    }
+}
+
+/// Records the title's rumble request, which [`watch`] puts on the pad's motors.
+pub fn set_rumble(strong: u16, weak: u16) {
+    STRONG.store(strong, Ordering::Relaxed);
+    WEAK.store(weak, Ordering::Relaxed);
+}
+
+/// The rumble the title last asked for, as the strong and weak magnitudes.
+#[must_use]
+pub fn rumble() -> (u16, u16) {
+    (STRONG.load(Ordering::Relaxed), WEAK.load(Ordering::Relaxed))
+}
+
+/// Watches a physical pad on its own thread, which reads its reports faster than the window
+/// delivers frames: a pad that stops answering (asleep or unplugged) releases the buttons it held,
+/// and is looked for again a second later.
+pub fn watch() {
+    std::thread::spawn(|| {
+        loop {
+            let mut pad = rumblepad::Controller::open().ok();
+            set(Pad::default(), pad.is_some());
+            let mut gone = false;
+            let mut applied = (0, 0);
+            let mut buttons = 0;
+            while !gone {
+                let Some(controller) = pad.as_mut() else {
+                    break;
+                };
+                match controller.poll(0) {
+                    Ok(Some(state)) => {
+                        for shortcut in shortcuts(buttons, state.buttons) {
+                            match shortcut {
+                                Shortcut::Snapshot => &SNAPSHOT_PRESSED,
+                                Shortcut::Rewind => &REWIND_PRESSED,
+                            }
+                            .store(true, Ordering::Relaxed);
+                        }
+                        buttons = state.buttons;
+                        set(from_state(&state), true);
+                    }
+                    Ok(None) => std::thread::sleep(Duration::from_millis(2)),
+                    Err(_) => gone = true,
+                }
+                let motors = rumble();
+                if motors != applied {
+                    let motor = |v: u16| f32::from(v) / 65_535.0;
+                    let _ = controller.rumble(motor(motors.0), motor(motors.1));
+                    applied = motors;
+                }
+            }
+            pad = None;
+            set(Pad::default(), false);
+            std::thread::sleep(Duration::from_secs(1));
+        }
+    });
+}
+
+/// Publishes the pad's state for [`held`].
+fn set(pad: Pad, connected: bool) {
+    *GAMEPAD
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner) = (pad, connected);
 }
 
 /// One control of the controller, as `ANYXBOX_PRESS` names it.
@@ -280,6 +457,40 @@ mod tests {
             from_keys(&[Key::Left, Key::Right]).sticks[0],
             0,
             "opposite keys cancel"
+        );
+    }
+
+    #[test]
+    fn a_physical_pad_maps_onto_the_xbox_layout() {
+        let pad = from_state(&rumblepad::State {
+            buttons: rumblepad::btn::A
+                | rumblepad::btn::L
+                | rumblepad::btn::ZR
+                | rumblepad::btn::PLUS
+                | rumblepad::btn::UP
+                | rumblepad::btn::HOME,
+            left: (1.0, -1.0),
+            right: (0.0, 0.0),
+        });
+        assert_eq!(pad.buttons, UP | START, "Home has no Xbox button");
+        assert_eq!(pad.analog, [255, 0, 0, 0, 0, 255, 0, 255]);
+        assert_eq!(pad.sticks, [i16::MAX, -i16::MAX, 0, 0]);
+    }
+
+    #[test]
+    fn capture_and_home_are_shortcuts_on_their_press() {
+        use rumblepad::btn;
+        let pressed = |before, now| shortcuts(before, now).collect::<Vec<_>>();
+        assert_eq!(pressed(0, btn::CAPTURE | btn::A), [Shortcut::Snapshot]);
+        assert_eq!(pressed(btn::A, btn::HOME | btn::A), [Shortcut::Rewind]);
+        assert!(
+            pressed(btn::CAPTURE, btn::CAPTURE).is_empty(),
+            "a hold is one press"
+        );
+        assert!(pressed(btn::HOME, 0).is_empty(), "a release is no press");
+        assert_eq!(
+            pressed(0, btn::CAPTURE | btn::HOME),
+            [Shortcut::Snapshot, Shortcut::Rewind]
         );
     }
 

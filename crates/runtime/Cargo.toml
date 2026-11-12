@@ -12,6 +12,7 @@ repository.workspace = true
 crate-type = ["staticlib", "lib"]
 
 [dependencies]
+bytemuck = "1.25"
 cpal = "0.18.2"
 crt-off = { version = "0.2.1", default-features = false }
 des = "0.8"
@@ -30,6 +31,7 @@ png = "0.18.1"
 pollster = "1.0.1"
 postcard = { version = "1", default-features = false, features = ["use-std"] }
 raw-window-handle = "0.6"
+rumblepad = "0.1.1"
 serde = { version = "1", features = ["derive", "rc"] }
 sha1 = { version = "0.10", features = ["compress"] }
 wgpu = "30.0.1"

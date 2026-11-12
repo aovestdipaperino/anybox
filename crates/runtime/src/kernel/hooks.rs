@@ -220,8 +220,20 @@ fn input_get_state(k: &mut Kernel, c: &Call) -> KResult<CallResult> {
     Ok(CallResult::Value(0))
 }
 
-/// `XInputSetState(h, *feedback)`: the feedback completes at once.
+/// `XInputSetState(h, *feedback)`: the feedback completes at once, and its motors go to the pad.
+/// The two magnitudes ride at `+66` and `+68`, past the header whose status is cleared, and fade
+/// together up to `0xFFFF`.
+/// shortcut: that offset is measured on `Dragon's Lair 3D` alone; a title whose feedback header
+/// is a different size will rumble wrongly, and the fix is to take the offset from the header.
 fn input_set_state(k: &mut Kernel, c: &Call) -> KResult<CallResult> {
+    match k.read(c.arg(1) + 66, 4) {
+        Ok(m) => crate::host::input::set_rumble(
+            u16::from_le_bytes([m[0], m[1]]),
+            u16::from_le_bytes([m[2], m[3]]),
+        ),
+        // An unreadable buffer must not leave the motors running.
+        Err(_) => crate::host::input::set_rumble(0, 0),
+    }
     k.w32(c.arg(1), 0)?;
     Ok(CallResult::Value(0))
 }
@@ -271,6 +283,31 @@ mod tests {
         }];
         assert_eq!(gamepad_types(&sections, 0x2000), [0x1234_5678]);
         assert_eq!(gamepad_types(&sections, 0x3000), Vec::<u32>::new());
+    }
+
+    #[test]
+    fn xinput_set_state_hands_the_motors_past_the_header_to_the_pad() {
+        let mut k = crate::kernel::testing::kernel();
+        let buffer = crate::mem::HEAP_BASE + 0x2F_0000;
+        k.write(buffer, &[0u8; 96]).unwrap();
+        let set = handler("XInputSetState").unwrap();
+        let call = Call {
+            args: vec![GAMEPAD_HANDLE, buffer],
+            esp: 0,
+        };
+        k.w16(buffer + 66, 0xF766).unwrap();
+        k.w16(buffer + 68, 0xE646).unwrap();
+        assert!(matches!(set(&mut k, &call), Ok(CallResult::Value(0))));
+        assert_eq!(crate::host::input::rumble(), (0xF766, 0xE646));
+        assert_eq!(k.r32(buffer), Ok(0), "the header's status is cleared");
+        k.w16(buffer + 66, 0).unwrap();
+        k.w16(buffer + 68, 0).unwrap();
+        set(&mut k, &call).unwrap();
+        assert_eq!(
+            crate::host::input::rumble(),
+            (0, 0),
+            "zeros stop the motors"
+        );
     }
 
     #[test]

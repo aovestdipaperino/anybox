@@ -190,6 +190,7 @@ mod tests {
     /// primitives), and the renderer's alone (drawing primitives decoded once). Each frame is read
     /// back, as the file path does. Skips when unset.
     #[test]
+    #[allow(clippy::too_many_lines)]
     fn bench_dumped_frames() {
         let Ok(dumps) = std::env::var("ANYXBOX_BENCH_DUMPS") else {
             return;
@@ -232,7 +233,54 @@ mod tests {
                     })
                 })
                 .collect();
+            let deferring: Vec<f64> = (0..rounds)
+                .map(|_| {
+                    timed(&mut || {
+                        std::hint::black_box(crate::gpu::draw::defer_only(&commands));
+                    })
+                })
+                .collect();
+            let (deferring, _) = median_and_best(deferring);
+            let bound = crate::gpu::draw::bound(&commands);
+            assert_eq!(bound, crate::gpu::draw::bound_by_replay(&commands));
+            let mut binding = (Vec::new(), Vec::new());
+            for _ in 0..rounds.min(10) {
+                binding.0.push(timed(&mut || {
+                    std::hint::black_box(crate::gpu::draw::bound(&commands));
+                }));
+                binding.1.push(timed(&mut || {
+                    std::hint::black_box(crate::gpu::draw::bound_by_replay(&commands));
+                }));
+            }
+            let ((binding, _), (replaying, _)) =
+                (median_and_best(binding.0), median_and_best(binding.1));
+            eprintln!(
+                "bench {path}: the {} bound textures {binding:.2} ms (by replaying every command \
+                 {replaying:.2} ms)",
+                bound.len()
+            );
+            eprintln!("bench {path}: the commands without their programs {deferring:.1} ms");
             let primitives = crate::gpu::draw::primitives(&commands);
+            // The frame drawn, as a hash of its pixels: a change to the renderer that should not
+            // change the picture leaves it alone.
+            let pixels = renderer
+                .render_primitives(primitives.as_slice(), &textures)
+                .map_or(0, |image| {
+                    use std::hash::{Hash as _, Hasher as _};
+                    let mut hasher = std::collections::hash_map::DefaultHasher::new();
+                    (image.width, image.height, image.rgba).hash(&mut hasher);
+                    hasher.finish()
+                });
+            let batched = crate::render::batch::batches(&primitives, &mut |_| Some(0));
+            let expanded: usize = batched.iter().map(|b| b.vertices.len()).sum();
+            eprintln!(
+                "bench {path}: {} primitives, {} source vertices; {} batches, {expanded} vertices \
+                 drawn ({} MB); pixels {pixels:016x}",
+                primitives.len(),
+                primitives.iter().map(|p| p.vertices.len()).sum::<usize>(),
+                batched.len(),
+                (expanded * std::mem::size_of::<crate::render::batch::GpuVertex>()) >> 20,
+            );
             let drawing: Vec<f64> = (0..rounds)
                 .map(|_| {
                     timed(&mut || {
@@ -253,6 +301,54 @@ mod tests {
                  {drawing:.1} ms",
                 commands.len(),
                 1000.0 / frame,
+            );
+            let (draws, vertices, ops) = crate::gpu::draw::program_work(&commands);
+            let mut programs = Vec::new();
+            crate::gpu::draw::with_program_runs(&commands, |run| {
+                programs = (0..rounds)
+                    .map(|_| {
+                        timed(&mut || {
+                            std::hint::black_box(run());
+                        })
+                    })
+                    .collect();
+            });
+            let (programs, _) = median_and_best(programs);
+            let mut interpreted = Vec::new();
+            crate::gpu::draw::with_program_only(&commands, |run| {
+                interpreted = (0..rounds)
+                    .map(|_| {
+                        timed(&mut || {
+                            std::hint::black_box(run());
+                        })
+                    })
+                    .collect();
+            });
+            let (interpreted, _) = median_and_best(interpreted);
+            let mut alone = Vec::new();
+            crate::gpu::draw::with_interpreter_only(&commands, |run| {
+                alone = (0..rounds)
+                    .map(|_| {
+                        timed(&mut || {
+                            std::hint::black_box(run());
+                        })
+                    })
+                    .collect();
+            });
+            let (alone, _) = median_and_best(alone);
+            eprintln!(
+                "bench {path}: the interpreter alone {alone:.2} ms ({:.2} ns an instruction)",
+                alone * 1e6 / ops.max(1) as f64
+            );
+            eprintln!(
+                "bench {path}: {draws} programmed draws, {vertices} vertices, {ops} instructions \
+                 run; the programmed draws on one thread {programs:.2} ms ({:.1} ns a vertex, \
+                 {:.2} ns an instruction); the programs alone {interpreted:.2} ms ({:.2} ns an \
+                 instruction); outputs {:016x}",
+                programs * 1e6 / vertices.max(1) as f64,
+                programs * 1e6 / ops.max(1) as f64,
+                interpreted * 1e6 / ops.max(1) as f64,
+                crate::gpu::draw::program_checksum(&commands),
             );
         }
     }

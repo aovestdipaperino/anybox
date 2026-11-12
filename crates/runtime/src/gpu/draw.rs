@@ -336,14 +336,7 @@ impl State {
         {
             constant[component] = f32::from_bits(value);
         }
-        if (STAGE_BASE..STAGE_BASE + 4 * STAGE_STRIDE).contains(&method) {
-            let stage = ((method - STAGE_BASE) / STAGE_STRIDE) as usize;
-            let offset = (method - STAGE_BASE) % STAGE_STRIDE;
-            self.stages[stage].set(offset, value);
-            if offset == 0x0C {
-                self.stage_on[stage] = value & 1 << 30 != 0;
-            }
-        }
+        set_stage(&mut self.stages, &mut self.stage_on, method, value);
         self.shader.set(method, value);
         match method {
             COMBINER_CONTROL => self.combiner_set = true,
@@ -426,14 +419,7 @@ impl State {
 
     /// Each stage's texture, when the stage is on and its mode reads one.
     fn textures(&self) -> [Option<Texture>; 4] {
-        let modes = self.modes();
-        std::array::from_fn(|s| {
-            if self.stage_on[s] && modes[s].samples() {
-                self.stages[s].texture()
-            } else {
-                None
-            }
-        })
+        textures_of(&self.stages, self.stage_on, self.stage_program)
     }
 
     fn primitive(&self, kind: Kind) -> Primitive {
@@ -651,20 +637,17 @@ struct ProgramVertices {
 }
 
 impl ProgramVertices {
-    /// Runs the program over each vertex.
-    fn run(&self) -> Vec<(Vertex, f32)> {
-        let mut out = Vec::new();
-        for_each_input(&self.layout, &self.defaults, &self.words, |inputs| {
-            out.push(self.vertex(inputs));
+    /// Appends the inputs of each vertex to `into`.
+    fn inputs(&self, into: &mut Vec<[[f32; 4]; 16]>) {
+        for_each_input(&self.layout, &self.defaults, &self.words, |vertex| {
+            into.push(*vertex);
         });
-        out
     }
 
     /// The vertex-program path: position, colour, texture coordinates and fog from its outputs;
     /// the point size is `SET_POINT_SIZE` (1 when 0), or the program's `oPts` with the point
     /// parameters on.
-    fn vertex(&self, inputs: &[[f32; 4]; 16]) -> (Vertex, f32) {
-        let out = program::run_decoded(&self.ops, &self.constants, inputs);
+    fn vertex(&self, out: &[[f32; 4]; 16]) -> (Vertex, f32) {
         let p = out[program::POSITION];
         let colour = out[program::DIFFUSE].map(|c| c.clamp(0.0, 1.0));
         let t = program::TEXTURE0;
@@ -735,11 +718,12 @@ struct Deferred {
 }
 
 impl Deferred {
-    fn primitives(&self) -> Vec<Primitive> {
-        let vertices = self.vertices.run();
-        let mut out = Vec::new();
-        self.open.finish(&vertices, &mut out);
-        out
+    /// The program and the constants it runs with: draws that share both run together.
+    fn key(&self) -> (*const Vec<Op>, *const Vec<[f32; 4]>) {
+        (
+            Arc::as_ptr(&self.vertices.ops),
+            Arc::as_ptr(&self.vertices.constants),
+        )
     }
 
     fn vertex_count(&self) -> usize {
@@ -748,15 +732,76 @@ impl Deferred {
     }
 }
 
+/// The deferred draws by the program and constants they run with, each group in the order
+/// its draws were drawn, and the groups in the order of their first draws. A frame draws
+/// thousands of small meshes with a few hundred programs, many with the constants unchanged
+/// between them, so a group runs many vertices together where a draw holds a handful.
+fn groups(deferred: &[Deferred]) -> Vec<Vec<usize>> {
+    let mut index = std::collections::HashMap::new();
+    let mut groups: Vec<Vec<usize>> = Vec::new();
+    for (i, d) in deferred.iter().enumerate() {
+        let group = *index.entry(d.key()).or_insert_with(|| {
+            groups.push(Vec::new());
+            groups.len() - 1
+        });
+        groups[group].push(i);
+    }
+    groups
+}
+
+/// The vertices of each draw in `group`, with the program run over all of them together.
+fn run_group(deferred: &[Deferred], group: &[usize]) -> Vec<Vec<(Vertex, f32)>> {
+    let Some(&first) = group.first() else {
+        return Vec::new();
+    };
+    let mut inputs = Vec::new();
+    let mut ends = Vec::with_capacity(group.len());
+    for &i in group {
+        deferred[i].vertices.inputs(&mut inputs);
+        ends.push(inputs.len());
+    }
+    let shared = &deferred[first].vertices;
+    let outputs = program::run_batch(&shared.ops, &shared.constants, &inputs);
+    let mut start = 0;
+    group
+        .iter()
+        .zip(ends)
+        .map(|(&i, end)| {
+            let vertices = &deferred[i].vertices;
+            let draw = outputs[start..end]
+                .iter()
+                .map(|out| vertices.vertex(out))
+                .collect();
+            start = end;
+            draw
+        })
+        .collect()
+}
+
+/// The primitives of each draw in `group`, by the draw's index.
+fn group_primitives(deferred: &[Deferred], group: &[usize]) -> Vec<(usize, Vec<Primitive>)> {
+    run_group(deferred, group)
+        .into_iter()
+        .zip(group)
+        .map(|(vertices, &i)| {
+            let mut out = Vec::new();
+            deferred[i].open.finish(&vertices, &mut out);
+            (i, out)
+        })
+        .collect()
+}
+
 /// Programmed vertices fewer than this in a frame run on the one thread.
 const PARALLEL_VERTICES: usize = 2048;
 
-/// Runs the deferred draws' programs on up to eight threads, each taking the next draw not yet
-/// taken, and puts their primitives in `out` where they were drawn.
+/// Runs the deferred draws' programs on up to eight threads, each taking the next group of
+/// draws not yet taken (see [`groups`]), and puts their primitives in `out` where they were
+/// drawn.
 fn run_deferred(out: Vec<Primitive>, deferred: &[Deferred]) -> Vec<Primitive> {
     if deferred.is_empty() {
         return out;
     }
+    let groups = groups(deferred);
     let total: usize = deferred.iter().map(Deferred::vertex_count).sum();
     let threads = if total < PARALLEL_VERTICES {
         1
@@ -764,23 +809,27 @@ fn run_deferred(out: Vec<Primitive>, deferred: &[Deferred]) -> Vec<Primitive> {
         std::thread::available_parallelism()
             .map_or(1, std::num::NonZero::get)
             .min(8)
-            .min(deferred.len())
+            .min(groups.len())
     };
-    let mut results: Vec<Vec<Primitive>> = if threads <= 1 {
-        deferred.iter().map(Deferred::primitives).collect()
+    let mut results = vec![Vec::new(); deferred.len()];
+    if threads <= 1 {
+        for group in &groups {
+            for (i, primitives) in group_primitives(deferred, group) {
+                results[i] = primitives;
+            }
+        }
     } else {
         let next = std::sync::atomic::AtomicUsize::new(0);
         let work = || {
             let mut done = Vec::new();
             loop {
-                let i = next.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-                let Some(d) = deferred.get(i) else {
+                let g = next.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                let Some(group) = groups.get(g) else {
                     return done;
                 };
-                done.push((i, d.primitives()));
+                done.extend(group_primitives(deferred, group));
             }
         };
-        let mut results = vec![Vec::new(); deferred.len()];
         std::thread::scope(|scope| {
             let handles: Vec<_> = (1..threads).map(|_| scope.spawn(work)).collect();
             let mine = work();
@@ -792,8 +841,7 @@ fn run_deferred(out: Vec<Primitive>, deferred: &[Deferred]) -> Vec<Primitive> {
                 results[i] = primitives;
             }
         });
-        results
-    };
+    }
     let added: usize = results.iter().map(Vec::len).sum();
     let mut merged = Vec::with_capacity(out.len() + added);
     let mut before = out.into_iter();
@@ -998,6 +1046,10 @@ pub(crate) struct InlineShadow {
     at: usize,
     words: usize,
     open: bool,
+    /// The vertex layout the formats give, made when first needed after one changes: a frame's
+    /// thousands of draws mostly share it.
+    #[serde(skip)]
+    layout: Option<Vec<(usize, u32, u32, usize)>>,
 }
 
 impl InlineShadow {
@@ -1041,7 +1093,11 @@ impl InlineShadow {
         }
         match method {
             m if (ARRAY_FORMAT..ARRAY_FORMAT + 64).contains(&m) => {
-                self.formats[((m - ARRAY_FORMAT) / 4) as usize] = value;
+                let format = &mut self.formats[((m - ARRAY_FORMAT) / 4) as usize];
+                if *format != value {
+                    *format = value;
+                    self.layout = None;
+                }
             }
             SET_BEGIN_END if value != 0 => {
                 let stride = self.formats.iter().map(|&f| attribute_words(f)).sum();
@@ -1058,8 +1114,11 @@ impl InlineShadow {
                     && self.words >= stride
                     && self.words.is_multiple_of(stride)
                 {
-                    let layout = layout(|i| self.formats[i as usize]);
-                    self.values.carry(&layout, &self.vertex);
+                    let formats = self.formats;
+                    let layout = self
+                        .layout
+                        .get_or_insert_with(|| layout(|i| formats[i as usize]));
+                    self.values.carry(layout, &self.vertex);
                 }
                 self.open = false;
             }
@@ -1145,6 +1204,143 @@ pub fn shows_anything(primitives: &[Primitive]) -> bool {
 /// vertices once the commands are in, on several threads.
 #[must_use]
 pub fn primitives(commands: &[Command]) -> Vec<Primitive> {
+    let (out, deferred) = defer(commands);
+    run_deferred(out, &deferred)
+}
+
+/// Applies a frame's commands without running a program: the part of [`primitives`] before
+/// [`run_deferred`].
+#[cfg(test)]
+pub(crate) fn defer_only(commands: &[Command]) -> usize {
+    let (out, deferred) = defer(commands);
+    out.len() + deferred.len()
+}
+
+/// The vertex-program work in a frame's commands: the programmed draws, their vertices, and the
+/// instructions run over them all.
+#[cfg(test)]
+pub(crate) fn program_work(commands: &[Command]) -> (usize, usize, usize) {
+    let (_, deferred) = defer(commands);
+    let vertices: usize = deferred.iter().map(Deferred::vertex_count).sum();
+    let ops: usize = deferred
+        .iter()
+        .map(|d| d.vertex_count() * d.vertices.ops.len())
+        .sum();
+    let snapshots: std::collections::HashSet<*const Vec<[f32; 4]>> = deferred
+        .iter()
+        .map(|d| Arc::as_ptr(&d.vertices.constants))
+        .collect();
+    let programs: std::collections::HashSet<*const Vec<Op>> = deferred
+        .iter()
+        .map(|d| Arc::as_ptr(&d.vertices.ops))
+        .collect();
+    eprintln!(
+        "program work: {} constant snapshots ({} KB), {} decoded programs",
+        snapshots.len(),
+        snapshots.len() * program::CONSTANTS * 16 / 1024,
+        programs.len()
+    );
+    let mut sizes: Vec<usize> = groups(&deferred)
+        .iter()
+        .map(|g| {
+            g.iter()
+                .map(|&i| deferred[i].vertex_count() * deferred[i].vertices.ops.len())
+                .sum()
+        })
+        .collect();
+    sizes.sort_unstable_by(|a, b| b.cmp(a));
+    eprintln!(
+        "group work: {} groups, largest {:?} of {ops} instructions",
+        sizes.len(),
+        &sizes[..sizes.len().min(6)]
+    );
+    (deferred.len(), vertices, ops)
+}
+
+/// Times the programmed draws of a frame's commands alone, run on one thread: the commands are
+/// applied once, then `f` gets a function that runs every deferred draw.
+#[cfg(test)]
+pub(crate) fn with_program_runs(commands: &[Command], f: impl FnOnce(&dyn Fn() -> usize)) {
+    let (_, deferred) = defer(commands);
+    let groups = groups(&deferred);
+    f(&|| {
+        groups
+            .iter()
+            .map(|group| group_primitives(&deferred, group).len())
+            .sum()
+    });
+}
+
+/// As [`with_program_runs`], but with every group's inputs made beforehand, so `f`'s function
+/// times the interpreter alone.
+#[cfg(test)]
+pub(crate) fn with_interpreter_only(commands: &[Command], f: impl FnOnce(&dyn Fn() -> usize)) {
+    let (_, deferred) = defer(commands);
+    let batches: Vec<_> = groups(&deferred)
+        .iter()
+        .map(|group| {
+            let mut inputs = Vec::new();
+            for &i in group {
+                deferred[i].vertices.inputs(&mut inputs);
+            }
+            (&deferred[group[0]].vertices, inputs)
+        })
+        .collect();
+    f(&|| {
+        batches
+            .iter()
+            .map(|(shared, inputs)| {
+                program::run_batch(&shared.ops, &shared.constants, inputs).len()
+            })
+            .sum()
+    });
+}
+
+/// A hash of every programmed vertex a frame's commands make, bit for bit: two interpreters
+/// agree on a frame when they give it the same hash.
+#[cfg(test)]
+pub(crate) fn program_checksum(commands: &[Command]) -> u64 {
+    use std::hash::{Hash as _, Hasher as _};
+    let (_, deferred) = defer(commands);
+    let mut draws = vec![Vec::new(); deferred.len()];
+    for group in groups(&deferred) {
+        for (vertices, &i) in run_group(&deferred, &group).into_iter().zip(&group) {
+            draws[i] = vertices;
+        }
+    }
+    let mut hasher = std::collections::hash_map::DefaultHasher::new();
+    for draw in draws {
+        for (v, size) in draw {
+            let floats = [v.x, v.y, v.depth, v.w, v.fog, size]
+                .into_iter()
+                .chain(v.colour)
+                .chain(v.texture.into_iter().flatten())
+                .chain(v.specular);
+            for float in floats {
+                float.to_bits().hash(&mut hasher);
+            }
+        }
+    }
+    hasher.finish()
+}
+
+/// As [`with_program_runs`], but `f`'s function runs the programs only, without assembling
+/// their primitives.
+#[cfg(test)]
+pub(crate) fn with_program_only(commands: &[Command], f: impl FnOnce(&dyn Fn() -> usize)) {
+    let (_, deferred) = defer(commands);
+    let groups = groups(&deferred);
+    f(&|| {
+        groups
+            .iter()
+            .map(|group| run_group(&deferred, group).len())
+            .sum()
+    });
+}
+
+/// The primitives of a frame's commands drawn without a program, in order, and the programmed
+/// draws still to run, each with where its primitives go.
+fn defer(commands: &[Command]) -> (Vec<Primitive>, Vec<Deferred>) {
     let mut state = State::new();
     let mut open: Option<Open> = None;
     // One buffer for every primitive's words, emptied between them.
@@ -1198,7 +1394,7 @@ pub fn primitives(commands: &[Command]) -> Vec<Primitive> {
             method => state.apply(method, command.value),
         }
     }
-    run_deferred(out, &deferred)
+    (out, deferred)
 }
 
 /// Pushes what a primitive of kind `begin` with `vertices` (each with its point size) draws:
@@ -1290,6 +1486,33 @@ pub(super) fn wide_line(a: Vertex, b: Vertex, width: f32) -> Vec<Vertex> {
 /// order.
 #[must_use]
 pub fn bound(commands: &[Command]) -> Vec<Texture> {
+    // Only what the textures depend on is followed: the stages' registers, which stages are on,
+    // and the shader stage program. The frame is delivered from the title's thread, which waits.
+    let fresh = State::new();
+    let (mut stages, mut on, mut program) = (fresh.stages, fresh.stage_on, fresh.stage_program);
+    let mut textures: Vec<Texture> = Vec::new();
+    for command in commands.iter().filter(|c| c.class == KELVIN) {
+        match command.method {
+            SET_BEGIN_END => {
+                if Begin::from_value(command.value).is_some() {
+                    for texture in textures_of(&stages, on, program).into_iter().flatten() {
+                        if !textures.contains(&texture) {
+                            textures.push(texture);
+                        }
+                    }
+                }
+            }
+            SHADER_STAGE_PROGRAM => program = Some(command.value),
+            method => set_stage(&mut stages, &mut on, method, command.value),
+        }
+    }
+    textures
+}
+
+/// [`bound`] by applying every command to a whole state, as it once was: the reference the
+/// dump bench holds it to.
+#[cfg(test)]
+pub(crate) fn bound_by_replay(commands: &[Command]) -> Vec<Texture> {
     let mut state = State::new();
     let mut textures: Vec<Texture> = Vec::new();
     for command in commands.iter().filter(|c| c.class == KELVIN) {
@@ -1304,6 +1527,34 @@ pub fn bound(commands: &[Command]) -> Vec<Texture> {
         }
     }
     textures
+}
+
+/// A texture-stage method, if `method` is one: the stage's register, and whether it is on.
+fn set_stage(stages: &mut [StageRegs; 4], on: &mut [bool; 4], method: u32, value: u32) {
+    if (STAGE_BASE..STAGE_BASE + 4 * STAGE_STRIDE).contains(&method) {
+        let stage = ((method - STAGE_BASE) / STAGE_STRIDE) as usize;
+        let offset = (method - STAGE_BASE) % STAGE_STRIDE;
+        stages[stage].set(offset, value);
+        if offset == 0x0C {
+            on[stage] = value & 1 << 30 != 0;
+        }
+    }
+}
+
+/// Each stage's texture, when the stage is on and the mode the shader stage program gives it
+/// reads one.
+fn textures_of(
+    stages: &[StageRegs; 4],
+    on: [bool; 4],
+    program: Option<u32>,
+) -> [Option<Texture>; 4] {
+    std::array::from_fn(|s| {
+        if on[s] && Mode::of(program, s, on[s]).samples() {
+            stages[s].texture()
+        } else {
+            None
+        }
+    })
 }
 
 #[cfg(test)]

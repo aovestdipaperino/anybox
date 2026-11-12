@@ -10,6 +10,7 @@ use std::process::ExitCode;
 const USAGE: &str = "\
 usage: anybox [--runtime DIR] [--work DIR] [--pack-level N] [--opt 0|1|2] [--rust] ISO ICON NAME DMG
        anybox [--runtime DIR] --plan ISO
+       anybox [--runtime DIR] --census ISO
        anybox --explain ADDRESS ISO
 
   ISO     the disc image (XDVDFS .iso)
@@ -28,6 +29,8 @@ usage: anybox [--runtime DIR] [--work DIR] [--pack-level N] [--opt 0|1|2] [--rus
   --rust            lift the title to Rust and build it with rustc, which needs no C compiler;
                     else it is lifted to C and built with clang
   --plan            print the library functions the runtime will replace, and stop
+  --census          count the instructions the title lifts to, the flags they compute that
+                    nothing reads, and the sequences that recur, and stop
   --explain ADDRESS lift the function at the hex ADDRESS alone, and print what it could not
                     translate, with each place's reason";
 
@@ -39,6 +42,7 @@ struct Options {
     pack_level: Option<i32>,
     opt: Option<String>,
     plan: bool,
+    census: bool,
     rust: bool,
     explain: Option<u32>,
     positional: Vec<String>,
@@ -85,6 +89,7 @@ impl Options {
                     }
                 }
                 "--plan" => options.plan = true,
+                "--census" => options.census = true,
                 "--rust" => options.rust = true,
                 "--help" | "-h" => return Err(USAGE.to_owned()),
                 _ if arg.starts_with("--") => return Err(format!("unknown option {arg}\n{USAGE}")),
@@ -118,6 +123,16 @@ fn run() -> Result<(), String> {
             return Err(USAGE.to_owned());
         };
         for line in anybox_core::explain(Path::new(iso), address)? {
+            println!("{line}");
+        }
+        return Ok(());
+    }
+    if options.census {
+        let [iso] = options.positional.as_slice() else {
+            return Err(USAGE.to_owned());
+        };
+        let runtime = runtime_dir(options.runtime.as_deref())?;
+        for line in anybox_core::census(Path::new(iso), &runtime)? {
             println!("{line}");
         }
         return Ok(());

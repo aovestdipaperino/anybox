@@ -38,6 +38,10 @@ unsafe extern "C" {
     /// The lifted code's digest, from the digest unit.
     static anyxbox_code_digest: [u8; 20];
     fn anyxbox_set_code_digest(digest: *const u8);
+    /// Where the lifted code can be resumed, from the resume unit.
+    static anyxbox_resume_map: [u8; 0];
+    static anyxbox_resume_map_end: [u8; 0];
+    fn anyxbox_set_resume_map(map: *const u8, len: usize);
     /// The title's executable, from the boot unit.
     static anyxbox_xbe: [u8; 0];
     static anyxbox_xbe_end: [u8; 0];
@@ -305,6 +309,12 @@ pub unsafe extern "C" fn main(_argc: i32, _argv: *const *const u8) -> i32 {
         let mut start = [0u32; 4];
         // Snapshots belong to this lifted code, whatever runtime it is linked with.
         anyxbox_set_code_digest((&raw const anyxbox_code_digest).cast::<u8>());
+        // and can be resumed by another build of it that has every frame they hold.
+        let map = (&raw const anyxbox_resume_map).cast::<u8>();
+        anyxbox_set_resume_map(
+            map,
+            (&raw const anyxbox_resume_map_end as usize) - (map as usize),
+        );
         let xbe = (&raw const anyxbox_xbe).cast::<u8>();
         let len = (&raw const anyxbox_xbe_end as usize) - (xbe as usize);
         G = anyxbox_boot(xbe, len, start.as_mut_ptr());

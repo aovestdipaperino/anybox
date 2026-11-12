@@ -24,6 +24,9 @@ void anyxbox_main_loop(void);
 uint8_t *anyxbox_guest_base(void); /* the guest base the runtime set */
 extern const uint8_t anyxbox_code_digest[20]; /* the lifted code's digest, from digest.c */
 void anyxbox_set_code_digest(const uint8_t *digest);
+/* Where the lifted code can be resumed, from resume.c. */
+extern const uint8_t anyxbox_resume_map[], anyxbox_resume_map_end[];
+void anyxbox_set_resume_map(const uint8_t *map, size_t len);
 
 /* Where a host thread's guest CPU is, so a hibernation can save it and a restore fill it. */
 typedef struct {
@@ -207,6 +210,8 @@ int main(void) {
     uint32_t start[4] = {0, 0, 0, 0};
     /* Snapshots belong to this lifted code, whatever runtime it is linked with. */
     anyxbox_set_code_digest(anyxbox_code_digest);
+    /* and can be resumed by another build of it that has every frame they hold. */
+    anyxbox_set_resume_map(anyxbox_resume_map, (size_t)(anyxbox_resume_map_end - anyxbox_resume_map));
     G = anyxbox_boot(anyxbox_xbe, (size_t)(anyxbox_xbe_end - anyxbox_xbe), start);
     if (!G) return 1;
     if (start[3]) {
@@ -409,16 +414,37 @@ pub(crate) fn compile_in_parallel(
 /// The C unit that embeds the file at `xbe`, an absolute path, as `anyxbox_xbe`, with
 /// `anyxbox_xbe_end` just past it. Done in assembly because a C array of megabytes compiles slowly.
 pub(crate) fn embed_source(xbe: &Path) -> String {
-    let path = xbe
+    embed_file(xbe, "anyxbox_xbe")
+}
+
+/// The C unit that embeds the file at `file`, an absolute path, as `symbol`, with `symbol_end`
+/// just past it.
+fn embed_file(file: &Path, symbol: &str) -> String {
+    let path = file
         .display()
         .to_string()
         .replace('\\', "\\\\")
         .replace('"', "\\\"");
     let assembly = format!(
-        ".section __DATA,__const\n.globl _anyxbox_xbe\n_anyxbox_xbe:\n.incbin \"{path}\"\n\
-         .globl _anyxbox_xbe_end\n_anyxbox_xbe_end:\n.text\n"
+        ".section __DATA,__const\n.globl _{symbol}\n_{symbol}:\n.incbin \"{path}\"\n\
+         .globl _{symbol}_end\n_{symbol}_end:\n.text\n"
     );
     format!("__asm__({});\n", c_string(&assembly))
+}
+
+/// Writes the program's resume map (see [`lift::resume`]) to `out/resume.bin` and the unit that
+/// embeds it to `out/resume.c`, and returns that unit.
+pub(crate) fn write_resume_unit(
+    out: &Path,
+    map: &lift::resume::ResumeMap,
+) -> Result<PathBuf, String> {
+    let file = crate::write_resume_map(out, map)?;
+    let unit = out.join("resume.c");
+    let text = embed_file(&file, "anyxbox_resume_map");
+    if !std::fs::read(&unit).is_ok_and(|have| have == text.as_bytes()) {
+        std::fs::write(&unit, text).map_err(|error| error.to_string())?;
+    }
+    Ok(unit)
 }
 
 /// Writes the title's executable to `out/boot.xbe` and the unit that embeds it to `out/boot.c`,

@@ -276,7 +276,10 @@ impl Kernel {
                     })
                 })
                 .collect();
-            let _ = sink.try_send((frame.commands, textures));
+            crate::render::TITLE_FRAMES.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+            if sink.try_send((frame.commands, textures)).is_err() {
+                crate::render::DROPPED_FRAMES.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+            }
         }
     }
 

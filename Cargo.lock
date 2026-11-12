@@ -205,14 +205,14 @@ checksum = "940b3a0ca603d1eade50a4846a2afffd5ef57a9feac2c0e2ec2e14f9ead76000"
 
 [[package]]
 name = "anybox-cli"
-version = "0.1.0"
+version = "0.2.0"
 dependencies = [
  "anybox-core",
 ]
 
 [[package]]
 name = "anybox-core"
-version = "0.1.0"
+version = "0.2.0"
 dependencies = [
  "iced-x86",
  "lift",
@@ -225,7 +225,7 @@ dependencies = [
 
 [[package]]
 name = "anybox-gui"
-version = "0.1.0"
+version = "0.2.0"
 dependencies = [
  "anybox-core",
  "futures",
@@ -2952,6 +2952,19 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "dfa686283ad6dd069f105e5ab091b04c62850d3e4cf5d67debad1933f55023df"
 
 [[package]]
+name = "hidapi"
+version = "2.6.7"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "818c0e1d27887aaf76fe737042e27a66b796a7b099e6d2e1a72d106c2dff3fa6"
+dependencies = [
+ "cc",
+ "cfg-if",
+ "libc",
+ "pkg-config",
+ "windows-sys 0.61.2",
+]
+
+[[package]]
 name = "hkdf"
 version = "0.12.4"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -3622,7 +3635,7 @@ dependencies = [
 
 [[package]]
 name = "lift"
-version = "0.1.0"
+version = "0.2.0"
 dependencies = [
  "iced-x86",
  "object",
@@ -4792,7 +4805,7 @@ dependencies = [
 
 [[package]]
 name = "pack"
-version = "0.1.0"
+version = "0.2.0"
 dependencies = [
  "xiso",
  "zstd",
@@ -5699,9 +5712,19 @@ dependencies = [
 ]
 
 [[package]]
-name = "runtime"
-version = "0.1.0"
+name = "rumblepad"
+version = "0.1.1"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "6f9df33238b141230b647d7e596a52b4f8ac93e07d47b62fa676f41906fd450a"
 dependencies = [
+ "hidapi",
+]
+
+[[package]]
+name = "runtime"
+version = "0.2.0"
+dependencies = [
+ "bytemuck",
  "cpal",
  "crt-off",
  "des",
@@ -5720,6 +5743,7 @@ dependencies = [
  "pollster 1.0.1",
  "postcard",
  "raw-window-handle",
+ "rumblepad",
  "serde",
  "sha1",
  "wgpu 30.0.1",
@@ -8606,7 +8630,7 @@ checksum = "ea6fc2961e4ef194dcbfe56bb845534d0dc8098940c7e5c012a258bfec6701bd"
 
 [[package]]
 name = "xbe"
-version = "0.1.0"
+version = "0.2.0"
 
 [[package]]
 name = "xcb"
@@ -8628,7 +8652,7 @@ checksum = "163b33ed8786455e2fa5d72f554057ce3f3182425434f756cd39c99839d88e23"
 
 [[package]]
 name = "xdk"
-version = "0.1.0"
+version = "0.2.0"
 dependencies = [
  "iced-x86",
 ]
@@ -8653,7 +8677,7 @@ dependencies = [
 
 [[package]]
 name = "xiso"
-version = "0.1.0"
+version = "0.2.0"
 
 [[package]]
 name = "xkbcommon"

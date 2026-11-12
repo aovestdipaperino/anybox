@@ -1,5 +1,6 @@
-//! A Reset button, a volume slider and a floppy (which blinks after a perma snapshot and goes
-//! back to it on a double-click) in the window's title bar, which `minifb` has no API for:
+//! A Reset button, a volume slider, a floppy (which blinks after a perma snapshot and goes
+//! back to it on a double-click) and a joypad shown while a physical pad is connected, in the
+//! window's title bar, which `minifb` has no API for:
 //! they are added with `AppKit` to the view that holds the window's own buttons and title, at its
 //! right end. A
 //! title bar accessory would be the usual way, but the window then reserves room for it below the
@@ -45,6 +46,9 @@ thread_local! {
     /// The floppy before the button, shown while the title has a perma snapshot; main thread
     /// only.
     static FLOPPY: RefCell<Option<Retained<NSButton>>> = const { RefCell::new(None) };
+    /// The joypad before the speaker icon, shown while a physical pad is connected; main thread
+    /// only.
+    static PAD: RefCell<Option<Retained<NSImageView>>> = const { RefCell::new(None) };
     /// When the last perma snapshot was written, while the floppy blinks for it.
     static SAVED_AT: Cell<Option<Instant>> = const { Cell::new(None) };
 }
@@ -175,14 +179,21 @@ pub(crate) fn add_title_bar_controls(window: &minifb::Window) {
     button.setAutoresizingMask(NSAutoresizingMaskOptions::ViewMinXMargin);
     title_bar.addSubview(&button);
     let left = add_floppy(&title_bar, &target, button.frame().origin.x, mtm);
-    add_volume_slider(&title_bar, &target, left, mtm);
+    let left = add_volume_slider(&title_bar, &target, left, mtm);
+    add_gamepad(&title_bar, left, mtm);
     // A control does not keep its target: this one lives as long as the program.
     std::mem::forget(target);
 }
 
 /// Adds the volume slider, and a speaker icon before it, to `title_bar`, ending `right` points
-/// from its left edge; the slider starts at the volume kept from the last title.
-fn add_volume_slider(title_bar: &NSView, target: &ResetTarget, right: f64, mtm: MainThreadMarker) {
+/// from its left edge; the slider starts at the volume kept from the last title. Returns where the
+/// icon starts.
+fn add_volume_slider(
+    title_bar: &NSView,
+    target: &ResetTarget,
+    right: f64,
+    mtm: MainThreadMarker,
+) -> f64 {
     let key = NSString::from_str(VOLUME_KEY);
     let volume = defaults()
         .filter(|defaults| defaults.objectForKey(&key).is_some())
@@ -211,17 +222,37 @@ fn add_volume_slider(title_bar: &NSView, target: &ResetTarget, right: f64, mtm: 
     slider.setAutoresizingMask(NSAutoresizingMaskOptions::ViewMinXMargin);
     title_bar.addSubview(&slider);
     let Some(image) = speaker_image(volume) else {
+        return slider_x;
+    };
+    let icon = NSImageView::imageViewWithImage(&image, mtm);
+    let size = icon.frame().size;
+    let x = slider_x - ICON_GAP - size.width;
+    icon.setFrameOrigin(NSPoint::new(x, (bar - size.height) / 2.0));
+    icon.setAutoresizingMask(NSAutoresizingMaskOptions::ViewMinXMargin);
+    title_bar.addSubview(&icon);
+    SPEAKER.with(|speaker| *speaker.borrow_mut() = Some(icon));
+    x
+}
+
+/// Adds the joypad to `title_bar`, ending `right` points from its left edge, hidden until a
+/// physical pad is found.
+fn add_gamepad(title_bar: &NSView, right: f64, mtm: MainThreadMarker) {
+    let Some(image) = NSImage::imageWithSystemSymbolName_accessibilityDescription(
+        &NSString::from_str("gamecontroller.fill"),
+        Some(&NSString::from_str("Gamepad")),
+    ) else {
         return;
     };
     let icon = NSImageView::imageViewWithImage(&image, mtm);
     let size = icon.frame().size;
     icon.setFrameOrigin(NSPoint::new(
-        slider_x - ICON_GAP - size.width,
-        (bar - size.height) / 2.0,
+        right - ICON_GAP - size.width,
+        (title_bar.frame().size.height - size.height) / 2.0,
     ));
     icon.setAutoresizingMask(NSAutoresizingMaskOptions::ViewMinXMargin);
+    icon.setHidden(true);
     title_bar.addSubview(&icon);
-    SPEAKER.with(|speaker| *speaker.borrow_mut() = Some(icon));
+    PAD.with(|pad| *pad.borrow_mut() = Some(icon));
 }
 
 /// Adds the floppy to `title_bar`, ending `right` points from its left edge, shown if the title
@@ -257,6 +288,16 @@ fn add_floppy(title_bar: &NSView, target: &ResetTarget, right: f64, mtm: MainThr
 /// Starts the floppy blinking, as a perma snapshot has been written. Main thread only.
 pub(crate) fn show_saved() {
     SAVED_AT.set(Some(Instant::now()));
+}
+
+/// Shows the joypad while a physical pad is connected; the window loop calls it every frame. Main
+/// thread only.
+pub(crate) fn show_gamepad(connected: bool) {
+    PAD.with(|pad| {
+        if let Some(pad) = pad.borrow().as_ref() {
+            pad.setHidden(!connected);
+        }
+    });
 }
 
 /// Shows or hides the floppy for this moment of its blinking, then leaves it shown, as the perma

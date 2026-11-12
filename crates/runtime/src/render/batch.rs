@@ -19,38 +19,18 @@ pub struct GpuVertex {
     pub specular: [f32; 4],
 }
 
+// SAFETY: `repr(C)` and nothing but `f32`s, 128 bytes with no padding (see the test): any bytes
+// are a vertex, and a vertex's bytes are all initialised.
+unsafe impl bytemuck::Zeroable for GpuVertex {}
+// SAFETY: as for `Zeroable`.
+unsafe impl bytemuck::Pod for GpuVertex {}
+
 impl GpuVertex {
-    /// The vertex's bytes, as the vertex buffer holds them.
+    /// The vertices' bytes, as the vertex buffer holds them: their own, the host being little
+    /// endian as the shader reads them.
     #[must_use]
-    pub fn bytes(vertices: &[Self]) -> Vec<u8> {
-        let mut out = Vec::with_capacity(std::mem::size_of_val(vertices));
-        Self::append_bytes(vertices, &mut out);
-        out
-    }
-
-    /// Appends the vertices' bytes, as the vertex buffer holds them, to `out`.
-    pub fn append_bytes(vertices: &[Self], out: &mut Vec<u8>) {
-        out.reserve(std::mem::size_of_val(vertices));
-        for v in vertices {
-            out.extend_from_slice(&v.to_bytes());
-        }
-    }
-
-    /// The vertex's bytes.
-    #[must_use]
-    pub fn to_bytes(&self) -> [u8; std::mem::size_of::<Self>()] {
-        let mut out = [0; std::mem::size_of::<Self>()];
-        let floats = self
-            .clip
-            .iter()
-            .chain(&self.colour)
-            .chain(&self.fog)
-            .chain(self.texture.as_flattened())
-            .chain(&self.specular);
-        for (bytes, f) in out.as_chunks_mut::<4>().0.iter_mut().zip(floats) {
-            *bytes = f.to_le_bytes();
-        }
-        out
+    pub fn bytes(vertices: &[Self]) -> &[u8] {
+        bytemuck::cast_slice(vertices)
     }
 }
 
@@ -239,6 +219,12 @@ fn colour_key_mask(texture: &Texture) -> u32 {
 #[must_use]
 pub fn indices(kind: Kind, n: usize) -> Vec<usize> {
     let mut out = Vec::new();
+    push_indices(kind, n, &mut out);
+    out
+}
+
+/// Appends [`indices`] to `out`.
+fn push_indices(kind: Kind, n: usize, out: &mut Vec<usize>) {
     match kind {
         Kind::Points => {}
         Kind::Lines => out.extend(0..n - n % 2),
@@ -263,7 +249,6 @@ pub fn indices(kind: Kind, n: usize) -> Vec<usize> {
             }
         }
     }
-    out
 }
 
 /// Joins `primitives` into batches. `content_id` gives a texture's content id, or `None` when its
@@ -273,6 +258,9 @@ pub fn batches<'a>(
     content_id: &mut dyn FnMut(&Texture) -> Option<u64>,
 ) -> Vec<Batch> {
     let mut out: Vec<Batch> = Vec::new();
+    // Each primitive's list order and its vertices placed in clip space, kept for their capacity.
+    let mut order = Vec::new();
+    let mut placed = Vec::new();
     for p in primitives {
         let lines = p.kind == Kind::Lines;
         let cull = if matches!(p.kind, Kind::Lines | Kind::Points) {
@@ -322,7 +310,8 @@ pub fn batches<'a>(
             }),
             feedback,
         };
-        let order = indices(p.kind, p.vertices.len());
+        order.clear();
+        push_indices(p.kind, p.vertices.len(), &mut order);
         if order.is_empty() {
             continue;
         }
@@ -340,8 +329,10 @@ pub fn batches<'a>(
             continue;
         };
         let logical = p.pixel.target.logical_size();
-        batch.vertices.extend(order.into_iter().map(|i| {
-            let mut v = clip(&p.vertices[i], logical, p.fog);
+        // Each vertex once, however many triangles of a strip share it; then the list's copies.
+        placed.clear();
+        placed.extend(p.vertices.iter().map(|vertex| {
+            let mut v = clip(vertex, logical, p.fog);
             if lines {
                 // Pulled toward the eye so outlines pass the depth test.
                 v.clip[2] -= 0.001 * v.clip[3];
@@ -349,6 +340,7 @@ pub fn batches<'a>(
             place(&state.depth_range, &mut v.clip);
             v
         }));
+        batch.vertices.extend(order.iter().map(|&i| placed[i]));
     }
     out
 }

@@ -2,10 +2,9 @@
 //!
 //! The bit positions follow the spec, which marks them as needing independent confirmation.
 
-/// Instruction slots, constants, inputs, temporaries and outputs.
+/// Instruction slots and constants.
 pub const SLOTS: usize = 136;
 pub const CONSTANTS: usize = 192;
-const REGISTERS: usize = 16;
 /// The temporary that is the output position under another name: a program reads its position
 /// back through it (for the divide and the viewport step) and may write it.
 const POSITION_TEMP: usize = 12;
@@ -96,44 +95,89 @@ impl Program {
     }
 }
 
-/// An operand's source, decoded: where it reads (1 a temporary, 2 the input, 3 the constant,
-/// anything else zero), the component each of x, y, z and w takes, and the negation.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+/// The registers of one run, in one file: the temporaries, the outputs, the inputs, and a
+/// register that is always zero. R12 is the output position under another name, so its own slot
+/// goes unused.
+const TEMPS: usize = 0;
+const OUTPUTS: usize = 16;
+const INPUTS: usize = 32;
+const ZERO: usize = 48;
+const FILE: usize = 49;
+/// The register of a source that reads the instruction's constant.
+const CONSTANT: u8 = u8::MAX;
+
+/// The slot in the file of temporary `index`: R12 is the output position.
+#[allow(clippy::cast_possible_truncation)]
+fn temp_slot(index: u32) -> u8 {
+    if index as usize == POSITION_TEMP {
+        OUTPUTS as u8
+    } else {
+        (TEMPS as u32 + index) as u8
+    }
+}
+
+/// An operand's source, decoded: the slot it reads in the file (or the constant), the component
+/// each of x, y, z and w takes, and the sign bit it flips, as negation does.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
 struct Source {
-    mux: u8,
     register: u8,
     swizzle: [u8; 4],
-    negate: bool,
+    negate: u32,
 }
 
 impl Source {
     /// A source that reads zero, for an operand no running unit uses.
+    #[allow(clippy::cast_possible_truncation)]
     const ZERO: Self = Self {
-        mux: 0,
-        register: 0,
+        register: ZERO as u8,
         swizzle: [0, 1, 2, 3],
-        negate: false,
+        negate: 0,
     };
 }
 
+/// Where a result goes: the slot in the file and, for each of x, y, z and w, all ones when it is
+/// written.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct Write {
+    register: u8,
+    mask: [u32; 4],
+}
+
+impl Write {
+    /// A write to `register` under a 4-bit mask whose bit 3 is x.
+    fn new(register: u8, mask: u8) -> Self {
+        Self {
+            register,
+            mask: [8, 4, 2, 1].map(|bit| if mask & bit != 0 { u32::MAX } else { 0 }),
+        }
+    }
+}
+
+/// Where an instruction's output goes: an output register under a mask, or the fog, whose x
+/// takes the one component given.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Output {
+    Register(Write),
+    Fog(u8),
+}
+
 /// One instruction, decoded once so that each vertex only runs it.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct Op {
     /// The vector operation (13 is ARL), and the scalar one.
     mac: u8,
     ilu: u8,
     /// Operands A, B and C.
     sources: [Source; 3],
-    input: u8,
     /// The constant it reads, before the address register's offset, and whether that applies.
     constant: i32,
     relative: bool,
-    /// The temporary and mask each unit's result goes to, when it writes one.
-    mac_write: Option<(u8, u8)>,
-    ilu_write: Option<(u8, u8)>,
-    /// The output register and mask, when it writes one, and whether it takes the scalar
-    /// result rather than the vector one.
-    output: Option<(u8, u8)>,
+    /// Where each unit's result goes, when it writes a temporary.
+    mac_write: Option<Write>,
+    ilu_write: Option<Write>,
+    /// Where the output goes, when it writes one, and whether it takes the scalar result rather
+    /// than the vector one.
+    output: Option<Output>,
     output_from_ilu: bool,
 }
 
@@ -167,18 +211,24 @@ pub fn decode(instructions: &[[u32; 4]], start: usize) -> Vec<Op> {
 
 #[allow(clippy::cast_possible_truncation)]
 fn decode_one(insn: &[u32; 4], mac_op: u32, ilu_op: u32) -> Op {
+    let input = field(insn, 1, 9, 4);
+    // Where a source reads: 1 a temporary, 2 the input, 3 the constant, anything else zero.
     let source = |negate: u32, swizzle: u32, mux: u32, register: u32, scalar: bool| {
         // Four 2-bit selectors, x in the top pair; the scalar ops read C with x replicated.
         let select = |i: u32| ((swizzle >> (6 - 2 * i)) & 3) as u8;
         Source {
-            mux: mux as u8,
-            register: register as u8,
+            register: match mux {
+                1 => temp_slot(register),
+                2 => (INPUTS as u32 + input) as u8,
+                3 => CONSTANT,
+                _ => ZERO as u8,
+            },
             swizzle: if scalar {
                 [select(0); 4]
             } else {
                 [select(0), select(1), select(2), select(3)]
             },
-            negate: negate != 0,
+            negate: if negate != 0 { 0x8000_0000 } else { 0 },
         }
     };
     let a = source(
@@ -212,13 +262,14 @@ fn decode_one(insn: &[u32; 4], mac_op: u32, ilu_op: u32) -> Op {
     let (mac, ilu) = (mac_runs(mac_op), ilu_runs(ilu_op));
     let uses_c = uses_c || ilu;
     let uses_a = mac || mac_op == 13;
-    let temp = field(insn, 3, 20, 4) as u8;
+    let temp = field(insn, 3, 20, 4);
     let both = mac && ilu;
     let mac_mask = field(insn, 3, 24, 4) as u8;
     let ilu_mask = field(insn, 3, 16, 4) as u8;
     let out_mask = field(insn, 3, 12, 4) as u8;
     let out_from_ilu = field(insn, 3, 2, 1) != 0;
     let out_unit_runs = if out_from_ilu { ilu } else { mac };
+    let out_index = (field(insn, 3, 3, 8) & 0xF) as usize;
     Op {
         mac: mac_op as u8,
         ilu: ilu_op as u8,
@@ -227,15 +278,22 @@ fn decode_one(insn: &[u32; 4], mac_op: u32, ilu_op: u32) -> Op {
             if uses_b { b } else { Source::ZERO },
             if uses_c { c } else { Source::ZERO },
         ],
-        input: field(insn, 1, 9, 4) as u8,
         constant: field(insn, 1, 13, 8).cast_signed(),
         relative: insn[3] & 2 != 0,
         // With both units running, the scalar result goes to R1, and the vector one is not
         // written when its temporary is R1 too.
-        mac_write: (mac && !(both && temp == 1) && mac_mask != 0).then_some((temp, mac_mask)),
-        ilu_write: (ilu && ilu_mask != 0).then_some((if both { 1 } else { temp }, ilu_mask)),
-        output: (out_mask != 0 && field(insn, 3, 11, 1) != 0 && out_unit_runs)
-            .then_some(((field(insn, 3, 3, 8) & 0xF) as u8, out_mask)),
+        mac_write: (mac && !(both && temp == 1) && mac_mask != 0)
+            .then(|| Write::new(temp_slot(temp), mac_mask)),
+        ilu_write: (ilu && ilu_mask != 0)
+            .then(|| Write::new(temp_slot(if both { 1 } else { temp }), ilu_mask)),
+        output: (out_mask != 0 && field(insn, 3, 11, 1) != 0 && out_unit_runs).then(|| {
+            if out_index == FOG {
+                // Scalar: x takes the first component the mask selects.
+                Output::Fog((0..4u8).find(|i| out_mask & (8 >> i) != 0).unwrap_or(0))
+            } else {
+                Output::Register(Write::new((OUTPUTS + out_index) as u8, out_mask))
+            }
+        }),
         output_from_ilu: out_from_ilu,
     }
 }
@@ -243,44 +301,52 @@ fn decode_one(insn: &[u32; 4], mac_op: u32, ilu_op: u32) -> Op {
 /// The registers of one run.
 struct Machine<'a> {
     constants: &'a [Vec4],
-    inputs: &'a [Vec4; 16],
-    temps: [Vec4; REGISTERS],
+    file: [Vec4; FILE],
     address: i32,
-    outputs: [Vec4; 16],
 }
 
-impl Machine<'_> {
-    fn read(&self, source: Source, constant: Option<usize>, input: usize) -> Vec4 {
-        let value = match source.mux {
-            1 if usize::from(source.register) == POSITION_TEMP => self.outputs[POSITION],
-            1 => self.temps[usize::from(source.register)],
-            2 => self.inputs[input],
-            3 => constant
-                .and_then(|c| self.constants.get(c))
-                .copied()
-                .unwrap_or([0.0; 4]),
-            _ => return [0.0; 4],
-        };
-        let s = source.swizzle.map(usize::from);
-        let out = [value[s[0]], value[s[1]], value[s[2]], value[s[3]]];
-        if source.negate { out.map(|x| -x) } else { out }
-    }
-
-    /// Temporary `index` for writing; R12 is the output position.
-    fn temp_mut(&mut self, index: usize) -> &mut Vec4 {
-        if index == POSITION_TEMP {
-            &mut self.outputs[POSITION]
-        } else {
-            &mut self.temps[index]
+impl<'a> Machine<'a> {
+    /// A run for one vertex with `inputs`: the temporaries zero, the outputs `(0, 0, 0, 1)`.
+    fn new(constants: &'a [Vec4], inputs: &[Vec4; 16]) -> Self {
+        let mut file = [[0.0; 4]; FILE];
+        file[OUTPUTS..INPUTS].fill([0.0, 0.0, 0.0, 1.0]);
+        file[INPUTS..ZERO].copy_from_slice(inputs);
+        Self {
+            constants,
+            file,
+            address: 0,
         }
     }
-}
 
-/// Writes `value` into `target` under a 4-bit mask whose bit 3 is x.
-fn write_masked(target: &mut Vec4, value: Vec4, mask: u8) {
-    for (i, slot) in target.iter_mut().enumerate() {
-        if mask & (8 >> i) != 0 {
-            *slot = value[i];
+    /// The 16 outputs.
+    fn outputs(&self) -> [Vec4; 16] {
+        let mut outputs = [[0.0; 4]; 16];
+        outputs.copy_from_slice(&self.file[OUTPUTS..INPUTS]);
+        outputs
+    }
+
+    /// What `source` reads, with `constant` the constant this instruction reads, if any.
+    #[inline]
+    fn read(&self, source: Source, constant: Option<usize>) -> Vec4 {
+        let value = if source.register == CONSTANT {
+            constant
+                .and_then(|c| self.constants.get(c))
+                .copied()
+                .unwrap_or([0.0; 4])
+        } else {
+            self.file[usize::from(source.register)]
+        };
+        source
+            .swizzle
+            .map(|s| f32::from_bits(value[usize::from(s & 3)].to_bits() ^ source.negate))
+    }
+
+    /// Writes `value` where `to` says, under its mask.
+    #[inline]
+    fn write(&mut self, to: Write, value: Vec4) {
+        let slot = &mut self.file[usize::from(to.register)];
+        for ((old, new), mask) in slot.iter_mut().zip(value).zip(to.mask) {
+            *old = f32::from_bits((new.to_bits() & mask) | (old.to_bits() & !mask));
         }
     }
 }
@@ -369,32 +435,43 @@ pub fn run(program: &Program, inputs: &[Vec4; 16]) -> [Vec4; 16] {
 /// Runs a program [`decode`] made for one vertex with `inputs` and the program's `constants`.
 #[must_use]
 pub fn run_decoded(ops: &[Op], constants: &[Vec4], inputs: &[Vec4; 16]) -> [Vec4; 16] {
-    let mut m = Machine {
-        constants,
-        inputs,
-        temps: [[0.0; 4]; REGISTERS],
-        address: 0,
-        outputs: [[0.0, 0.0, 0.0, 1.0]; 16],
-    };
+    let mut m = Machine::new(constants, inputs);
     for op in ops {
         step(&mut m, op);
     }
-    m.outputs
+    m.outputs()
+}
+
+/// Runs a program [`decode`] made for each of `inputs`, as [`run_decoded`] does for one, and
+/// returns their outputs in order. The vertices run [`LANES`] at a time side by side (see
+/// [`Wide`]), so each instruction is taken apart once for all of them and its arithmetic is
+/// vector arithmetic.
+#[must_use]
+pub fn run_batch(ops: &[Op], constants: &[Vec4], inputs: &[[Vec4; 16]]) -> Vec<[Vec4; 16]> {
+    let mut outputs = Vec::with_capacity(inputs.len());
+    for batch in inputs.chunks(LANES) {
+        let mut m = Wide::new(constants, batch);
+        for op in ops {
+            m.step(op);
+        }
+        m.outputs(batch.len(), &mut outputs);
+    }
+    outputs
 }
 
 /// Runs one instruction: both units read before either writes.
+#[inline]
 fn step(m: &mut Machine<'_>, op: &Op) {
     let mut constant = op.constant;
     if op.relative {
         constant += m.address;
     }
     let constant = usize::try_from(constant).ok().filter(|&c| c < CONSTANTS);
-    let input = usize::from(op.input);
     let [a, b, c] = op.sources;
     let (va, vb, vc) = (
-        m.read(a, constant, input),
-        m.read(b, constant, input),
-        m.read(c, constant, input),
+        m.read(a, constant),
+        m.read(b, constant),
+        m.read(c, constant),
     );
     let mac_op = u32::from(op.mac);
     let mac_result = if mac_op == 13 {
@@ -406,28 +483,221 @@ fn step(m: &mut Machine<'_>, op: &Op) {
         mac(mac_op, va, vb, vc)
     };
     let ilu_result = ilu(u32::from(op.ilu), vc);
-    if let (Some(value), Some((temp, mask))) = (mac_result, op.mac_write) {
-        write_masked(m.temp_mut(usize::from(temp)), value, mask);
+    if let (Some(value), Some(to)) = (mac_result, op.mac_write) {
+        m.write(to, value);
     }
-    if let (Some(value), Some((temp, mask))) = (ilu_result, op.ilu_write) {
-        write_masked(m.temp_mut(usize::from(temp)), value, mask);
+    if let (Some(value), Some(to)) = (ilu_result, op.ilu_write) {
+        m.write(to, value);
     }
     let out_value = if op.output_from_ilu {
         ilu_result
     } else {
         mac_result
     };
-    if let (Some((index, mask)), Some(value)) = (op.output, out_value) {
-        let index = usize::from(index);
-        if index == FOG {
-            // Scalar: x takes the first component the mask selects.
-            if let Some(first) = (0..4).find(|i| mask & (8 >> i) != 0) {
-                m.outputs[FOG][0] = value[first];
-            }
-        } else {
-            write_masked(&mut m.outputs[index], value, mask);
+    if let (Some(output), Some(value)) = (op.output, out_value) {
+        match output {
+            Output::Register(to) => m.write(to, value),
+            Output::Fog(first) => m.file[OUTPUTS + FOG][0] = value[usize::from(first & 3)],
         }
     }
+}
+
+// The wide path is the hot loop of every programmed draw: left to the inliner it runs a third
+// slower, so its helpers are inlined always.
+
+/// Vertices a [`Wide`] machine runs side by side.
+const LANES: usize = 8;
+
+/// One component of a register, a lane for each vertex.
+type Lanes = [f32; LANES];
+
+/// A register of [`LANES`] vertices: x, y, z and w, each across the vertices.
+type Wide4 = [Lanes; 4];
+
+#[allow(clippy::inline_always)]
+#[inline(always)]
+fn lanes(f: impl FnMut(usize) -> f32) -> Lanes {
+    std::array::from_fn(f)
+}
+
+/// `f` on each lane of each component of `x` and `y`.
+#[allow(clippy::inline_always)]
+#[inline(always)]
+fn each(f: impl Fn(f32, f32) -> f32, x: &Wide4, y: &Wide4) -> Wide4 {
+    std::array::from_fn(|k| lanes(|l| f(x[k][l], y[k][l])))
+}
+
+/// The registers of [`LANES`] runs of one program side by side, laid out component by
+/// component so that an instruction does the same arithmetic on every lane. Each lane computes
+/// what [`step`] computes for its vertex, in the same order, so the results agree bit for bit.
+struct Wide<'a> {
+    constants: &'a [Vec4],
+    file: [Wide4; FILE],
+    address: [i32; LANES],
+}
+
+impl<'a> Wide<'a> {
+    /// The runs for up to [`LANES`] vertices with `inputs`, as [`Machine::new`] starts one. Lanes
+    /// past the inputs run on zeros and are not read back.
+    fn new(constants: &'a [Vec4], inputs: &[[Vec4; 16]]) -> Self {
+        let mut file = [[[0.0; LANES]; 4]; FILE];
+        for slot in &mut file[OUTPUTS..INPUTS] {
+            slot[3] = [1.0; LANES];
+        }
+        for (lane, inputs) in inputs.iter().enumerate() {
+            for (slot, input) in file[INPUTS..ZERO].iter_mut().zip(inputs) {
+                for (component, value) in slot.iter_mut().zip(input) {
+                    component[lane] = *value;
+                }
+            }
+        }
+        Self {
+            constants,
+            file,
+            address: [0; LANES],
+        }
+    }
+
+    /// Appends the 16 outputs of the first `count` lanes to `into`.
+    fn outputs(&self, count: usize, into: &mut Vec<[Vec4; 16]>) {
+        let outputs = &self.file[OUTPUTS..INPUTS];
+        into.extend(
+            (0..count)
+                .map(|lane| std::array::from_fn(|o| std::array::from_fn(|k| outputs[o][k][lane]))),
+        );
+    }
+
+    /// Constant `index`, or zero when it is out of range.
+    fn constant(&self, index: i32) -> Vec4 {
+        usize::try_from(index)
+            .ok()
+            .filter(|&c| c < CONSTANTS)
+            .and_then(|c| self.constants.get(c))
+            .copied()
+            .unwrap_or([0.0; 4])
+    }
+
+    /// What `source` of `op` reads, as [`Machine::read`].
+    #[allow(clippy::inline_always)]
+    #[inline(always)]
+    fn read(&self, source: Source, op: &Op) -> Wide4 {
+        let negate = |x: f32| f32::from_bits(x.to_bits() ^ source.negate);
+        if source.register == CONSTANT {
+            if op.relative {
+                let rows: [Vec4; LANES] =
+                    std::array::from_fn(|l| self.constant(op.constant + self.address[l]));
+                source
+                    .swizzle
+                    .map(|s| lanes(|l| negate(rows[l][usize::from(s & 3)])))
+            } else {
+                let row = self.constant(op.constant);
+                source
+                    .swizzle
+                    .map(|s| [negate(row[usize::from(s & 3)]); LANES])
+            }
+        } else {
+            let register = &self.file[usize::from(source.register)];
+            source
+                .swizzle
+                .map(|s| register[usize::from(s & 3)].map(negate))
+        }
+    }
+
+    /// Writes `value` where `to` says, under its mask.
+    #[allow(clippy::inline_always)]
+    #[inline(always)]
+    fn write(&mut self, to: Write, value: &Wide4) {
+        let slot = &mut self.file[usize::from(to.register)];
+        for ((old, new), mask) in slot.iter_mut().zip(value).zip(to.mask) {
+            if mask != 0 {
+                *old = *new;
+            }
+        }
+    }
+
+    /// Runs one instruction on every lane, as [`step`] runs it on one vertex.
+    #[allow(clippy::cast_possible_truncation)]
+    fn step(&mut self, op: &Op) {
+        let [a, b, c] = op.sources;
+        let (va, vb, vc) = (self.read(a, op), self.read(b, op), self.read(c, op));
+        let mac_result = if op.mac == 13 {
+            self.address =
+                std::array::from_fn(|l| (va[0][l] + 0.001).floor().clamp(-512.0, 511.0) as i32);
+            None
+        } else {
+            mac_wide(op.mac, &va, &vb, &vc)
+        };
+        let ilu_result = ilu_wide(op.ilu, &vc);
+        if let (Some(value), Some(to)) = (&mac_result, op.mac_write) {
+            self.write(to, value);
+        }
+        if let (Some(value), Some(to)) = (&ilu_result, op.ilu_write) {
+            self.write(to, value);
+        }
+        let out_value = if op.output_from_ilu {
+            &ilu_result
+        } else {
+            &mac_result
+        };
+        if let (Some(output), Some(value)) = (op.output, out_value) {
+            match output {
+                Output::Register(to) => self.write(to, value),
+                Output::Fog(first) => self.file[OUTPUTS + FOG][0] = value[usize::from(first & 3)],
+            }
+        }
+    }
+}
+
+/// The vector unit over [`LANES`] vertices, as [`mac`].
+#[allow(clippy::inline_always)]
+#[inline(always)]
+fn mac_wide(op: u8, a: &Wide4, b: &Wide4, c: &Wide4) -> Option<Wide4> {
+    let dot3 = || lanes(|l| a[0][l] * b[0][l] + a[1][l] * b[1][l] + a[2][l] * b[2][l]);
+    Some(match op {
+        1 => *a,
+        2 => each(times, a, b),
+        3 => each(|x, y| x + y, a, c),
+        4 => std::array::from_fn(|k| lanes(|l| times(a[k][l], b[k][l]) + c[k][l])),
+        5 => [dot3(); 4],
+        6 => {
+            let d = dot3();
+            [lanes(|l| d[l] + b[3][l]); 4]
+        }
+        7 => {
+            let d = dot3();
+            [lanes(|l| d[l] + a[3][l] * b[3][l]); 4]
+        }
+        8 => [[1.0; LANES], lanes(|l| a[1][l] * b[1][l]), a[2], b[3]],
+        9 => each(f32::min, a, b),
+        10 => each(f32::max, a, b),
+        11 => each(|x, y| f32::from(u8::from(x < y)), a, b),
+        12 => each(|x, y| f32::from(u8::from(x >= y)), a, b),
+        _ => return None,
+    })
+}
+
+/// The scalar unit over [`LANES`] vertices, as [`ilu`]: the common reciprocals across the lanes
+/// at once, the rest lane by lane.
+#[allow(clippy::inline_always)]
+#[inline(always)]
+fn ilu_wide(op: u8, c: &Wide4) -> Option<Wide4> {
+    let x = &c[0];
+    Some(match op {
+        1 => *c,
+        2 => [lanes(|l| 1.0 / x[l]); 4],
+        4 => [lanes(|l| 1.0 / x[l].abs().sqrt()); 4],
+        op if ilu_runs(u32::from(op)) => {
+            let mut out = [[0.0; LANES]; 4];
+            for lane in 0..LANES {
+                let value = ilu(u32::from(op), c.map(|component| component[lane]))?;
+                for (component, v) in out.iter_mut().zip(value) {
+                    component[lane] = v;
+                }
+            }
+            out
+        }
+        _ => return None,
+    })
 }
 
 #[cfg(test)]
@@ -710,6 +980,70 @@ mod tests {
         }
         .words();
         assert_eq!(run(&program, &inputs())[0], [1.0, 2.0, 3.0, 1.0]);
+    }
+
+    #[test]
+    #[allow(clippy::cast_precision_loss)]
+    fn a_batch_gives_each_vertex_what_it_gets_alone() {
+        let mut program = Program::default();
+        let constants = Arc::make_mut(&mut program.constants);
+        for (row, constant) in constants.iter_mut().enumerate() {
+            *constant = [row as f32, -0.5, 2.0, 0.25];
+        }
+        // ARL from v1.x; o0 = c[A0 + 2] * v0 + v0; RSQ(v0.x) to R3; o3 = R3 (the scalar unit's
+        // result), last.
+        program.instructions[0] = Insn {
+            mac: 13,
+            input: 1,
+            a: (2, 0),
+            ..Insn::default()
+        }
+        .words();
+        let mut mad = Insn {
+            mac: 4,
+            constant: 2,
+            a: (3, 0),
+            b: (2, 0),
+            c: (2, 0),
+            ilu: 4,
+            ilu_mask: 15,
+            temp: 3,
+            out_mask: 15,
+            out: 0,
+            ..Insn::default()
+        }
+        .words();
+        mad[3] |= 2;
+        program.instructions[1] = mad;
+        program.instructions[2] = Insn {
+            mac: 1,
+            a: (1, 3),
+            out_mask: 15,
+            out: 3,
+            last: true,
+            ..Insn::default()
+        }
+        .words();
+        // More vertices than one batch of lanes, the last batch part full.
+        let inputs: Vec<[Vec4; 16]> = (0..LANES + 3)
+            .map(|i| {
+                let mut inputs = inputs();
+                inputs[0][0] = i as f32 - 4.0;
+                inputs[1] = [(i % 5) as f32, 0.0, 0.0, 0.0];
+                inputs
+            })
+            .collect();
+        let alone: Vec<_> = inputs.iter().map(|inputs| run(&program, inputs)).collect();
+        let batch = run_batch(&program.decode(), &program.constants, &inputs);
+        let bits = |outputs: &[[Vec4; 16]]| -> Vec<u32> {
+            outputs
+                .iter()
+                .flatten()
+                .flatten()
+                .map(|x| x.to_bits())
+                .collect()
+        };
+        assert_eq!(bits(&batch), bits(&alone));
     }
 
     #[test]

@@ -454,6 +454,9 @@ fn fade_in(window: &mut minifb::Window, picture: Picture) -> Option<(Vec<u32>, u
 }
 
 /// Runs the window until quit, then exits the process. Without a window, parks forever.
+// The loop was already at the line limit before the physical pad joined it; each frame's work is
+// in its own helper, and the order of the steps is the point of the function.
+#[allow(clippy::too_many_lines)]
 pub fn main_loop() -> ! {
     let name = std::env::var("ANYXBOX_NAME").unwrap_or_else(|_| "anybox".to_owned());
     let Some(mut window) = window_enabled().then(|| open_window(&name)).flatten() else {
@@ -487,6 +490,8 @@ pub fn main_loop() -> ! {
     let mut booted_after = DELIVERED.load(Ordering::Relaxed);
     let (mut second, mut delivered_then) = (Instant::now(), booted_after);
     let mut keyboard = Pad::default();
+    // A physical pad is read on its own thread, and merged with the keyboard's.
+    input::watch();
     // With ANYXBOX_RECORD_INPUT, every change of the keyboard's controller goes to that file.
     let mut recorder = record::Recorder::from_env();
     loop {
@@ -496,7 +501,13 @@ pub fn main_loop() -> ! {
             switch_off(&mut window, &buffer, width, height);
             std::process::exit(0);
         }
-        let menu = window.is_menu_pressed();
+        // The pad's Capture and Home are the Perma Snapshot and Back to Perma Snapshot items.
+        let menu = window
+            .is_menu_pressed()
+            .or_else(|| match input::take_shortcut()? {
+                input::Shortcut::Snapshot => Some(MENU_PERMA),
+                input::Shortcut::Rewind => Some(MENU_REWIND),
+            });
         take_snapshot(menu, &mut window, &buffer, width, height);
         titlebar::blink();
         if (menu == Some(MENU_REWIND) || titlebar::rewind_clicked())
@@ -549,7 +560,9 @@ pub fn main_loop() -> ! {
         if window.is_key_pressed(minifb::Key::F12, minifb::KeyRepeat::No) {
             crate::render::dump_next();
         }
-        let pad = input::from_keys(&window.get_keys());
+        let (held, connected) = input::held();
+        titlebar::show_gamepad(connected);
+        let pad = input::from_keys(&window.get_keys()).merge(held);
         if pad != keyboard {
             keyboard = pad;
             apply(pad);

@@ -3,10 +3,10 @@
 //! Lifts a few hand-assembled functions and checks the C: its shape, and that a C compiler accepts
 //! it (when one is installed).
 
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet};
 use std::process::Command;
 
-use lift::{Image, lift_program};
+use lift::{Image, lift_program, lift_program_with_progress};
 
 const LEAF: u32 = 0x1000;
 const CALLER: u32 = 0x1010;
@@ -48,6 +48,41 @@ fn a_hooked_function_is_a_call_to_its_trap_and_its_own_code_is_ignored() {
         source.contains("rt_call(0x80010800u, 0x00001020u)"),
         "{source}"
     );
+}
+
+#[test]
+fn a_body_runs_on_through_a_weak_root_whose_own_function_stops_at_the_next_root() {
+    // inc eax ; inc eax ; ret, with roots at all three: the first strong, the others weak.
+    let image = Image::single(0x1000, vec![0x40, 0x40, 0xC3]);
+    let weak = BTreeSet::from([0x1001, 0x1002]);
+    let program = lift_program_with_progress(
+        &image,
+        &[0x1000, 0x1001, 0x1002],
+        &weak,
+        &BTreeMap::new(),
+        false,
+        &mut |_, _| {},
+    );
+    assert_eq!(program.lifted, 3, "each weak root is still a function");
+    let body = |entry: &str| {
+        program
+            .bodies()
+            .iter()
+            .find(|body| body.starts_with(&format!("void fn_{entry}(void)")))
+            .unwrap_or_else(|| panic!("no fn_{entry}"))
+            .clone()
+    };
+    let strong = body("00001000");
+    assert!(!strong.contains("LIFT_TAIL("), "{strong}");
+    assert!(strong.contains("L_00001002:"), "{strong}");
+    let first_weak = body("00001001");
+    assert!(
+        first_weak.contains("LIFT_TAIL(fn_00001002, 0x00001001u)"),
+        "{first_weak}"
+    );
+    // Strong as before, the first body stops at the second root.
+    let program = lift_program(&image, &[0x1000, 0x1001], &BTreeMap::new(), false);
+    assert!(program.bodies()[0].contains("LIFT_TAIL(fn_00001001, 0x00001000u)"));
 }
 
 #[test]
@@ -442,6 +477,61 @@ int main(void) {
 
 /// A jump table indexed by EBP (`cmp ebp, 3 ; ja out ; jmp [ebp*4 + table]`), which a compiler
 /// picks when the other registers are busy: it is a table, not an unknown indirect jump.
+#[test]
+fn a_loop_that_only_reads_memory_waits_and_one_that_changes_anything_polls() {
+    let back_edge = |bytes: Vec<u8>, branch: u32| {
+        let c = lift::lift(&Image::single(0x1000, bytes), 0x1000).expect("lifts");
+        if c.contains(&format!("LIFT_SPIN({branch:#010x}u)")) {
+            "spin"
+        } else if c.contains(&format!("LIFT_POLL({branch:#010x}u)")) {
+            "poll"
+        } else {
+            panic!("no back edge at {branch:#x}:\n{c}")
+        }
+    };
+    // A vertical-blank wait: the target loaded once, the count compared each turn.
+    let counter = vec![
+        0xA1, 0x00, 0x20, 0x00, 0x00, // mov eax, [0x2000]
+        0x39, 0x05, 0x00, 0x30, 0x00, 0x00, // wait: cmp [0x3000], eax
+        0x7C, 0xF8, // jl wait
+        0xC3, // ret
+    ];
+    assert_eq!(back_edge(counter, 0x100B), "spin");
+    // A flag loaded into a register each turn, then tested.
+    let flag = vec![
+        0x8B, 0x0D, 0x00, 0x30, 0x00, 0x00, // wait: mov ecx, [0x3000]
+        0x85, 0xC9, // test ecx, ecx
+        0x74, 0xF6, // jz wait
+        0xC3,
+    ];
+    assert_eq!(back_edge(flag, 0x1008), "spin");
+    // A timeout: the count each turn carries over, so turns differ.
+    let timeout = vec![
+        0x83, 0x3D, 0x00, 0x30, 0x00, 0x00, 0x00, // wait: cmp dword [0x3000], 0
+        0x75, 0x05, // jnz done
+        0x83, 0xC6, 0x01, // add esi, 1
+        0x75, 0xF2, // jnz wait
+        0xC3, // done: ret
+    ];
+    assert_eq!(back_edge(timeout, 0x100C), "poll");
+    // A store each turn.
+    let storing = vec![
+        0xA3, 0x00, 0x30, 0x00, 0x00, // again: mov [0x3000], eax
+        0x85, 0xC0, // test eax, eax
+        0x75, 0xF7, // jnz again
+        0xC3,
+    ];
+    assert_eq!(back_edge(storing, 0x1007), "poll");
+    // Flags read before the turn sets them: the first turn goes by the flags it came in with.
+    let stale = vec![
+        0x74, 0x08, // again: jz done
+        0x8B, 0x0D, 0x00, 0x30, 0x00, 0x00, // mov ecx, [0x3000]
+        0xEB, 0xF6, // jmp again
+        0xC3, // done: ret
+    ];
+    assert_eq!(back_edge(stale, 0x1008), "poll");
+}
+
 #[test]
 fn a_jump_table_indexed_by_ebp_is_found() {
     const TABLE: u32 = 0x1100;
@@ -1150,6 +1240,18 @@ fn a_setjmp_context_survives_a_resume() {
         false,
     );
     assert!(program.failures.is_empty() && program.traps.is_empty());
+    // The map names the `setjmp` call, the kernel call the thread freezes in, and the hooked
+    // function's own site, all by guest address.
+    for (function, site, kind) in [
+        (JMP_CALLER, JMP_CALLER + 5, lift::resume::KIND_SETJMP),
+        (JMP_CALLER, JMP_CALLER + 17, 0),
+        (NATIVE, NATIVE, 1),
+    ] {
+        assert!(
+            program.resume.contains(function, site, kind),
+            "{function:#x} {site:#x} {kind}"
+        );
+    }
     let main = format!(
         "{RESUME_HARNESS}int main(void) {{ int r = both_runs(fn_00001080, 0); if (!r && R_EAX != 7) r = 6; return r; }}\n"
     );

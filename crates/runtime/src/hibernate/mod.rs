@@ -8,6 +8,7 @@
 pub mod cpu;
 pub mod file;
 pub(crate) mod restore;
+pub mod resume_map;
 pub mod serde_util;
 pub mod state;
 
@@ -333,7 +334,8 @@ fn freeze_and_write(picture: Option<file::Picture>, perma: bool) -> Result<PathB
     let title = title().ok_or("no title has booted")?;
     let path = path(title).ok_or("no place to keep the snapshot (HOME is not set)")?;
     let path = if perma { perma_path(&path) } else { path };
-    let digest = file::executable_digest()?;
+    let xbe = crate::abi::xbe().ok_or("the title's executable is not known")?;
+    let build = file::Build::current(xbe)?;
     // A reason left by an earlier freeze must go before this one starts, or a thread that gives
     // up at once would have its reason cleared.
     drop(take_give_up());
@@ -359,7 +361,7 @@ fn freeze_and_write(picture: Option<file::Picture>, perma: bool) -> Result<PathB
             }
         }
     }
-    let written = crate::abi::with_kernel(|kernel| encode_frozen(kernel, title, &digest, picture))
+    let written = crate::abi::with_kernel(|kernel| encode_frozen(kernel, title, &build, picture))
         .unwrap_or_else(|| Err("the title is not running".to_owned()))
         .and_then(|bytes| file::write(&path, &bytes));
     match written {
@@ -376,7 +378,7 @@ fn freeze_and_write(picture: Option<file::Picture>, perma: bool) -> Result<PathB
 fn encode_frozen(
     kernel: &mut Kernel,
     title: u32,
-    digest: &[u8; 20],
+    build: &file::Build,
     picture: Option<file::Picture>,
 ) -> Result<Vec<u8>, String> {
     kernel.fs.persist();
@@ -401,7 +403,7 @@ fn encode_frozen(
         tsc: guest_tsc(),
         picture,
     };
-    let encoded = file::encode(&snapshot, title, digest);
+    let encoded = file::encode(&snapshot, title, build);
     snapshot.kernel.put_back(kernel);
     encoded
 }
