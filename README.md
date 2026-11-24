@@ -4,6 +4,8 @@
 
 # anybox
 
+[![GitHub stars](https://img.shields.io/github/stars/aovestdipaperino/anybox?logo=github&color=brightgreen)](https://github.com/aovestdipaperino/anybox/stargazers)
+
 Turns an original Xbox disc image into a macOS app, packed in a disk image, from the command line
 or from a window.
 
